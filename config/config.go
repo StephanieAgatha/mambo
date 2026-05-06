@@ -98,6 +98,8 @@ type Config struct {
 	MonitorAISec    int // Grok position analysis interval (default 1200s = 20min)
 }
 
+var PreFilterEnabled bool = true
+
 // Load reads .env then validates all required environment variables.
 func Load() (*Config, error) {
 	if err := godotenv.Load(); err != nil {
@@ -134,6 +136,19 @@ func Load() (*Config, error) {
 	} else {
 		cfg.HyperliquidAPIURL = HyperliquidMainnetURL
 	}
+
+	// ── Pre‑filter toggle ──────────────────────────────────────────────────
+preFilterStr := os.Getenv("ENABLE_PREFILTER")
+if preFilterStr == "" {
+    PreFilterEnabled = true // default menyala
+} else {
+    enabled, err := strconv.ParseBool(preFilterStr)
+    if err != nil {
+        PreFilterEnabled = true
+    } else {
+        PreFilterEnabled = enabled
+    }
+}
 
 	// ── AI Provider ───────────────────────────────────────────────────────────
 

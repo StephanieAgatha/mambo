@@ -30,6 +30,11 @@ type FilterResult struct {
 func ApplyPreFilter(pair string, result ta.TAResult, state BotState) FilterResult {
 	// ── Global limits — skip ALL pairs if triggered ───────────────────────────
 
+	if !config.PreFilterEnabled {
+		slog.Debug("pre-filter: DISABLED — all pairs pass")
+		return FilterResult{Pass: true, SkipAll: false, Reason: "pre-filter disabled"}
+	}
+	
 	// daily loss limit: 15% of balance
 	dailyLossLimit := state.Balance * config.DailyLossLimitPct
 	if state.DailyLossUSD >= dailyLossLimit {
