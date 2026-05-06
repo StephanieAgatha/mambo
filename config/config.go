@@ -56,7 +56,7 @@ var providerBaseURLs = map[string]string{
 	ProviderOpenAI:   "https://api.openai.com/v1",
 	ProviderDeepSeek: "https://agentrouter.org/",
 	// Anthropic uses a different API format — handled in ai/client.go
-	ProviderAnthropic: "https://api.anthropic.com",
+	ProviderAnthropic: "https://agentrouter.org/",
 }
 
 // defaultModels maps provider name → recommended default model.

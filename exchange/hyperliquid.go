@@ -82,11 +82,11 @@ func New(ctx context.Context, cfg *config.Config) (*Client, error) {
 		ctx,
 		privateKey,
 		apiURL,
-		nil,               // meta — fetched automatically
-		"",                // vault address — not using vault
+		nil, // meta — fetched automatically
+		"",  // vault address — not using vault
 		cfg.AccountAddress,
-		nil,               // spotMeta — fetched automatically
-		nil,               // perpDexs — fetched automatically
+		nil, // spotMeta — fetched automatically
+		nil, // perpDexs — fetched automatically
 	)
 
 	if cfg.Testnet {
@@ -113,27 +113,58 @@ func New(ctx context.Context, cfg *config.Config) (*Client, error) {
 	}, nil
 }
 
-// FetchBalance returns the available USDC balance (AccountValue) of the main account.
-// AccountValue includes unrealized PnL.
+// FetchBalance returns the available USDC balance from spot wallet.
+// This is the actual USDC balance available for trading, not the perp account value.
 func (c *Client) FetchBalance(ctx context.Context) (float64, error) {
-	state, err := c.info.UserState(ctx, c.cfg.AccountAddress)
+	// Get spot balances to find USDC balance
+	spotState, err := c.info.SpotUserState(ctx, c.cfg.AccountAddress)
 	if err != nil {
-		return 0, fmt.Errorf("exchange: fetch balance failed account=%s: %w", c.cfg.AccountAddress, err)
+		return 0, fmt.Errorf("exchange: fetch spot balance failed account=%s: %w", c.cfg.AccountAddress, err)
 	}
 
-	// sonirico SDK: MarginSummary.AccountValue is a raw string — parse it
-	balance, err := strconv.ParseFloat(state.MarginSummary.AccountValue, 64)
-	if err != nil {
-		return 0, fmt.Errorf("exchange: parse account value %q: %w", state.MarginSummary.AccountValue, err)
+	// Find USDC balance in spot balances
+	var usdcBalance float64
+	foundUSDC := false
+
+	if spotState != nil && spotState.Balances != nil {
+		for _, balance := range spotState.Balances {
+			if balance.Coin == "USDC" {
+				usdcBalance, err = strconv.ParseFloat(balance.Total, 64)
+				if err != nil {
+					return 0, fmt.Errorf("exchange: parse USDC total %q: %w", balance.Total, err)
+				}
+				foundUSDC = true
+				break
+			}
+		}
+	}
+
+	if !foundUSDC {
+		// Fallback to perp account value if USDC not found in spot balances
+		state, err := c.info.UserState(ctx, c.cfg.AccountAddress)
+		if err != nil {
+			return 0, fmt.Errorf("exchange: fetch perp balance failed account=%s: %w", c.cfg.AccountAddress, err)
+		}
+
+		usdcBalance, err = strconv.ParseFloat(state.MarginSummary.AccountValue, 64)
+		if err != nil {
+			return 0, fmt.Errorf("exchange: parse account value %q: %w", state.MarginSummary.AccountValue, err)
+		}
+
+		slog.Warn("USDC balance not found in spot wallet, using perp account value",
+			"account", c.cfg.AccountAddress,
+			"balance_usd", usdcBalance,
+		)
 	}
 
 	slog.Debug("balance fetched",
 		"account", c.cfg.AccountAddress,
-		"balance_usd", balance,
+		"balance_usd", usdcBalance,
 		"network", c.cfg.NetworkLabel(),
+		"source", map[bool]string{true: "spot", false: "perp"}[foundUSDC],
 	)
 
-	return balance, nil
+	return usdcBalance, nil
 }
 
 // FetchPositions returns all open perp positions for the main account.
@@ -231,15 +262,15 @@ func (c *Client) PlaceLimitOrder(
 	sizeCoins := sizeUSD / price
 
 	req := hyperliquid.CreateOrderRequest{
-    Coin:       pair,
-    IsBuy:      isBuy,
-    Size:       sizeCoins,   // was Sz
-    Price:      price,       // was LimitPx
-    OrderType:  hyperliquid.OrderType{
-        Limit: &hyperliquid.LimitOrderType{Tif: "Gtc"},
-    },
-    ReduceOnly: false,
-}
+		Coin:  pair,
+		IsBuy: isBuy,
+		Size:  sizeCoins, // was Sz
+		Price: price,     // was LimitPx
+		OrderType: hyperliquid.OrderType{
+			Limit: &hyperliquid.LimitOrderType{Tif: "Gtc"},
+		},
+		ReduceOnly: false,
+	}
 
 	// The 2nd arg is *BuilderInfo — pass nil (no vault, no custom nonce)
 	resp, err := c.ex.Order(ctx, req, nil)
@@ -299,8 +330,8 @@ func (c *Client) ClosePosition(ctx context.Context, pair string, side OrderSide)
 	req := hyperliquid.CreateOrderRequest{
 		Coin:       pair,
 		IsBuy:      isBuy,
-		Size:       0,                      // 0 + ReduceOnly = close entire position
-		Price:      0,                      // 0 = market order
+		Size:       0,                       // 0 + ReduceOnly = close entire position
+		Price:      0,                       // 0 = market order
 		OrderType:  hyperliquid.OrderType{}, // no limit fields → market
 		ReduceOnly: true,
 	}
