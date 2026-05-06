@@ -1,0 +1,11 @@
+{
+  "pairs": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "SUI",
+    "ARB"
+  ],
+  "timeframe": "4h",
+  "scan_interval_min": 15
+}
