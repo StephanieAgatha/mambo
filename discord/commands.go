@@ -370,199 +370,219 @@ func (b *Bot) handleCapital(s *discordgo.Session, i *discordgo.InteractionCreate
 
 // handleScan runs the full scan loop: fetches balance, picks random pairs, pre-filters, and scores with AI.
 // Responds immediately with "searching..." then edits once a result is found or all pairs exhausted.
+// If no trade is found, sleeps 3 minutes and retries up to 3 total scan cycles.
 func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
 
 	go func() {
+		const (
+			maxScanCycles    = 3
+			maxPairsPerCycle = 15
+			maxAIScores      = 10 // max AI calls per cycle to save tokens
+			retryDelay       = 3 * time.Minute
+		)
+
 		ctx := context.Background()
+		totalScanned := 0
+		globalSeen := make(map[string]bool)
 
-		balance, err := b.exClient.FetchBalance(ctx)
-		if err != nil {
-			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Embeds: &[]*discordgo.MessageEmbed{{
-					Title:       "❌ Scan Error",
-					Description: fmt.Sprintf("Failed to fetch balance: %s", err.Error()),
-					Color:       ColorRed,
-				}},
-			})
-			return
-		}
-
-		lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
-		if err != nil {
-			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Embeds: &[]*discordgo.MessageEmbed{{
-					Title:       "❌ Scan Error",
-					Description: fmt.Sprintf("Failed to fetch PnL: %s", err.Error()),
-					Color:       ColorRed,
-				}},
-			})
-			return
-		}
-
-		state := filter.BotState{
-			Balance:           balance,
-			DailyLossUSD:      lossUSD,
-			DailyWinUSD:       winUSD,
-			ConsecutiveLosses: consecLosses,
-		}
-
-		const maxAttempts = 15
-		seenPairs := make(map[string]bool)
-
-		for attempt := 0; attempt < maxAttempts; attempt++ {
-			pair, err := market.GetRandomPair()
-			if err != nil {
-				slog.Error("scan: random pair failed", "err", err)
-				break
-			}
-			if seenPairs[pair] {
-				continue
-			}
-			seenPairs[pair] = true
-
-			taResult, mc, err := b.refreshPairData(ctx, pair)
-			if err != nil {
-				continue
-			}
-
-			filterResult := filter.ApplyPreFilter(pair, taResult, state)
-			if !filterResult.Pass {
-				if filterResult.SkipAll {
-					b.NotifyDailyLimit(filterResult.Reason)
-					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-						Embeds: &[]*discordgo.MessageEmbed{{
-							Title:       "🛑 Scan Halted",
-							Description: filterResult.Reason,
-							Color:       ColorRed,
-						}},
-					})
-					return
-				}
-				continue
-			}
-
-			if !b.cfg.EnableAI {
-				// AI disabled — execute dummy order for testing Hyperliquid integration
-				orderResult, err := b.exClient.PlaceLimitOrder(
-					ctx,
-					pair,
-					exchange.OrderSideLong,
-					balance*0.10, // 10% of balance
-					taResult.CurrentPrice,
-					config.MaxLeverageX, // 10x
+		for cycle := 0; cycle < maxScanCycles; cycle++ {
+			if cycle > 0 {
+				slog.Info("scan: retrying after delay",
+					"cycle", cycle+1,
+					"delay", retryDelay,
 				)
-				if err != nil {
-					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-						Embeds: &[]*discordgo.MessageEmbed{{
-							Title:       fmt.Sprintf("❌ Order Failed — %s", pair),
-							Description: err.Error(),
-							Color:       ColorRed,
-						}},
-					})
-					return
-				}
+				time.Sleep(retryDelay)
+			}
 
-				b.SendEmbed(&discordgo.MessageEmbed{
-					Title:       fmt.Sprintf("🚀 DUMMY ORDER — %s", pair),
-					Description: fmt.Sprintf("AI disabled. Executed dummy LONG with 10%% balance at 10x."),
-					Color:       ColorGreen,
-					Fields: []*discordgo.MessageEmbedField{
-						{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
-						{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
-						{Name: "Leverage", Value: fmt.Sprintf("%dx", orderResult.Leverage), Inline: true},
-						{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
-					},
-					Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
-					Timestamp: time.Now().Format(time.RFC3339),
-				})
-
+			balance, err := b.exClient.FetchBalance(ctx)
+			if err != nil {
 				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 					Embeds: &[]*discordgo.MessageEmbed{{
+						Title:       "❌ Scan Error",
+						Description: fmt.Sprintf("Failed to fetch balance: %s", err.Error()),
+						Color:       ColorRed,
+					}},
+				})
+				return
+			}
+
+			lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
+			if err != nil {
+				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Embeds: &[]*discordgo.MessageEmbed{{
+						Title:       "❌ Scan Error",
+						Description: fmt.Sprintf("Failed to fetch PnL: %s", err.Error()),
+						Color:       ColorRed,
+					}},
+				})
+				return
+			}
+
+			state := filter.BotState{
+				Balance:           balance,
+				DailyLossUSD:      lossUSD,
+				DailyWinUSD:       winUSD,
+				ConsecutiveLosses: consecLosses,
+			}
+
+			aiScored := 0
+
+			for attempt := 0; attempt < maxPairsPerCycle && aiScored < maxAIScores; attempt++ {
+				pair, err := market.GetRandomPair()
+				if err != nil {
+					slog.Error("scan: random pair failed", "err", err)
+					break
+				}
+				if globalSeen[pair] {
+					continue
+				}
+				globalSeen[pair] = true
+				totalScanned++
+
+				taResult, mc, err := b.refreshPairData(ctx, pair)
+				if err != nil {
+					continue
+				}
+
+				filterResult := filter.ApplyPreFilter(pair, taResult, state)
+				if !filterResult.Pass {
+					if filterResult.SkipAll {
+						b.NotifyDailyLimit(filterResult.Reason)
+						s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+							Embeds: &[]*discordgo.MessageEmbed{{
+								Title:       "🛑 Scan Halted",
+								Description: filterResult.Reason,
+								Color:       ColorRed,
+							}},
+						})
+						return
+					}
+					continue
+				}
+
+				if !b.cfg.EnableAI {
+					orderResult, err := b.exClient.PlaceLimitOrder(
+						ctx,
+						pair,
+						exchange.OrderSideLong,
+						balance*0.10,
+						taResult.CurrentPrice,
+						config.MaxLeverageX,
+					)
+					if err != nil {
+						s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+							Embeds: &[]*discordgo.MessageEmbed{{
+								Title:       fmt.Sprintf("❌ Order Failed — %s", pair),
+								Description: err.Error(),
+								Color:       ColorRed,
+							}},
+						})
+						return
+					}
+
+					b.SendEmbed(&discordgo.MessageEmbed{
 						Title:       fmt.Sprintf("🚀 DUMMY ORDER — %s", pair),
-						Description: fmt.Sprintf("AI disabled. Executed dummy LONG at $%.4f.", orderResult.Price),
+						Description: "AI disabled. Executed dummy LONG with 10% balance at 10x.",
 						Color:       ColorGreen,
 						Fields: []*discordgo.MessageEmbedField{
+							{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
 							{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
 							{Name: "Leverage", Value: fmt.Sprintf("%dx", orderResult.Leverage), Inline: true},
 							{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
 						},
 						Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
 						Timestamp: time.Now().Format(time.RFC3339),
-					}},
-				})
-				return
-			}
+					})
 
-			score, err := b.scorer.Score(ctx, pair, taResult, mc, state)
-			if err != nil {
+					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+						Embeds: &[]*discordgo.MessageEmbed{{
+							Title:       fmt.Sprintf("🚀 DUMMY ORDER — %s", pair),
+							Description: fmt.Sprintf("AI disabled. Executed dummy LONG at $%.4f.", orderResult.Price),
+							Color:       ColorGreen,
+							Fields: []*discordgo.MessageEmbedField{
+								{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
+								{Name: "Leverage", Value: fmt.Sprintf("%dx", orderResult.Leverage), Inline: true},
+								{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
+							},
+							Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+							Timestamp: time.Now().Format(time.RFC3339),
+						}},
+					})
+					return
+				}
+
+				aiScored++
+				score, err := b.scorer.Score(ctx, pair, taResult, mc, state)
+				if err != nil {
+					b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
+						Timestamp: journal.Now(),
+						Pair:      pair,
+						TA:        taResult,
+						Market:    mc,
+						AIError:   err.Error(),
+					})
+					continue
+				}
+
+				aiLog := &journal.AIDecisionLog{
+					Action:          score.Action,
+					Leverage:        score.Leverage,
+					PositionSizeUSD: score.PositionSizeUSD,
+					StopLoss:        score.StopLoss,
+					TakeProfit:      score.TakeProfit,
+					Confidence:      score.Confidence,
+					Strategy:        score.Strategy,
+					ConfluenceCount: score.ConfluenceCount,
+					RRRatio:         score.RRRatio,
+					Reasoning:       score.Reasoning,
+				}
+
 				b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
-					Timestamp: journal.Now(),
-					Pair:      pair,
-					TA:        taResult,
-					Market:    mc,
-					AIError:   err.Error(),
+					Timestamp:  journal.Now(),
+					Pair:       pair,
+					TA:         taResult,
+					Market:     mc,
+					AIDecision: aiLog,
 				})
-				continue
-			}
 
-			aiLog := &journal.AIDecisionLog{
-				Action:          score.Action,
-				Leverage:        score.Leverage,
-				PositionSizeUSD: score.PositionSizeUSD,
-				StopLoss:        score.StopLoss,
-				TakeProfit:      score.TakeProfit,
-				Confidence:      score.Confidence,
-				Strategy:        score.Strategy,
-				ConfluenceCount: score.ConfluenceCount,
-				RRRatio:         score.RRRatio,
-				Reasoning:       score.Reasoning,
-			}
+				switch score.Action {
+				case "open_long", "open_short":
+					b.NotifyTradeExecuted(pair, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
+					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+						Embeds: &[]*discordgo.MessageEmbed{{
+							Title:       fmt.Sprintf("🚀 Trade Found — %s", pair),
+							Description: fmt.Sprintf("**%s** — %s", strings.ToUpper(score.Action), score.Reasoning),
+							Color:       ColorGreen,
+							Fields: []*discordgo.MessageEmbedField{
+								{Name: "Entry", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+								{Name: "SL", Value: fmt.Sprintf("$%.4f", score.StopLoss), Inline: true},
+								{Name: "TP", Value: fmt.Sprintf("$%.4f", score.TakeProfit), Inline: true},
+								{Name: "Size", Value: fmt.Sprintf("$%.2f", score.PositionSizeUSD), Inline: true},
+								{Name: "Leverage", Value: fmt.Sprintf("%dx", score.Leverage), Inline: true},
+								{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
+								{Name: "Strategy", Value: score.Strategy, Inline: true},
+								{Name: "R:R", Value: fmt.Sprintf("%.2f", score.RRRatio), Inline: true},
+							},
+							Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+							Timestamp: time.Now().Format(time.RFC3339),
+						}},
+					})
+					return
 
-			b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
-				Timestamp:  journal.Now(),
-				Pair:       pair,
-				TA:         taResult,
-				Market:     mc,
-				AIDecision: aiLog,
-			})
-
-			switch score.Action {
-			case "open_long", "open_short":
-				b.NotifyTradeExecuted(pair, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
-				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-					Embeds: &[]*discordgo.MessageEmbed{{
-						Title:       fmt.Sprintf("🚀 Trade Found — %s", pair),
-						Description: fmt.Sprintf("**%s** — %s", strings.ToUpper(score.Action), score.Reasoning),
-						Color:       ColorGreen,
-						Fields: []*discordgo.MessageEmbedField{
-							{Name: "Entry", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
-							{Name: "SL", Value: fmt.Sprintf("$%.4f", score.StopLoss), Inline: true},
-							{Name: "TP", Value: fmt.Sprintf("$%.4f", score.TakeProfit), Inline: true},
-							{Name: "Size", Value: fmt.Sprintf("$%.2f", score.PositionSizeUSD), Inline: true},
-							{Name: "Leverage", Value: fmt.Sprintf("%dx", score.Leverage), Inline: true},
-							{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
-							{Name: "Strategy", Value: score.Strategy, Inline: true},
-							{Name: "R:R", Value: fmt.Sprintf("%.2f", score.RRRatio), Inline: true},
-						},
-						Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
-						Timestamp: time.Now().Format(time.RFC3339),
-					}},
-				})
-				return
-
-			default:
-				continue
+				default:
+					continue
+				}
 			}
 		}
 
-		// no trade found
+		// all cycles exhausted — no trade found
 		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 			Embeds: &[]*discordgo.MessageEmbed{{
 				Title:       "🔍 No Trade Found",
-				Description: fmt.Sprintf("Scanned %d pairs — no qualifying setup found.", len(seenPairs)),
+				Description: fmt.Sprintf("Scanned %d pairs across %d cycles — no qualifying setup found.", totalScanned, maxScanCycles),
 				Color:       ColorYellow,
 				Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
 				Timestamp:   time.Now().Format(time.RFC3339),
