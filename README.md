@@ -236,15 +236,23 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 
 ### Slash Commands
 ```
-/check  coin:SOL   → TA + AI analysis with S/R levels
-/status            → open positions + live PnL
-/journal           → today's trades
-/journal week      → last 7 days
-/pnl               → total PnL + win rate
-/mode  auto|manual → toggle mode
-/capital           → balance + limits + budget
-/pairs             → active pairs
+/check  coin:SOL           → TA + AI analysis with S/R levels (read-only)
+/execute coin:SOL          → full pipeline: prefilter → AI → execute if approved
+/execute coin:SOL bypass:true → skip prefilter + AI, execute immediately with defaults
+/scan                      → scan random pairs for trade setup (auto-retry 3×, 3min delay)
+/status                    → open positions + live PnL
+/journal                   → today's trades
+/journal week              → last 7 days
+/pnl                       → total PnL + win rate
+/mode  auto|manual         → toggle mode
+/capital                   → balance + limits + budget
+/pairs                     → active pairs
 ```
+
+| Mode | Direction | Size | Leverage | Entry |
+|---|---|---|---|---|
+| `bypass:false` | AI decides | AI decides (5–20%) | AI decides (1–10x) | Current price (limit) |
+| `bypass:true` | LONG if > EMA200, else SHORT | 10% balance | 5x | Current price (limit) |
 
 ---
 

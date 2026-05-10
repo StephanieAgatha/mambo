@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -591,6 +592,244 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}()
 }
 
+// handleExecute places a real order — either through the full AI pipeline or directly.
+// bypass=true: skip prefilter + AI, execute immediately with formula defaults.
+// bypass=false (default): full prefilter → AI score → execute if AI approves.
+func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	data := i.ApplicationCommandData()
+	coin := strings.ToUpper(data.Options[0].StringValue())
+	bypass := false
+	for _, opt := range data.Options {
+		if opt.Name == "bypass" {
+			bypass = opt.BoolValue()
+		}
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+
+	go func() {
+		ctx := context.Background()
+
+		candles, err := b.fetcher.FetchOHLCV(ctx, coin, "4h", 200)
+		if err != nil {
+			slog.Error("discord: /execute fetch OHLCV failed", "coin", coin, "err", err)
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ %s — Data Error", coin),
+					Description: fmt.Sprintf("Failed to fetch OHLCV data: %s", err.Error()),
+					Color:       ColorRed,
+				}},
+			})
+			return
+		}
+
+		taResult, err := ta.Calculate(candles)
+		if err != nil {
+			slog.Error("discord: /execute TA failed", "coin", coin, "err", err)
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ %s — TA Error", coin),
+					Description: fmt.Sprintf("Failed to calculate indicators: %s", err.Error()),
+					Color:       ColorRed,
+				}},
+			})
+			return
+		}
+
+		mc, err := b.fetcher.FetchMarketContext(ctx, coin)
+		if err != nil {
+			slog.Warn("discord: /execute market context unavailable", "coin", coin, "err", err)
+		}
+
+		balance, err := b.exClient.FetchBalance(ctx)
+		if err != nil {
+			slog.Warn("discord: /execute fetch balance failed", "err", err)
+		}
+
+		lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
+		if err != nil {
+			slog.Warn("discord: /execute daily PnL failed", "err", err)
+		}
+
+		state := filter.BotState{
+			Balance:           balance,
+			DailyLossUSD:      lossUSD,
+			DailyWinUSD:       winUSD,
+			ConsecutiveLosses: consecLosses,
+			TotalAtRiskUSD:    0,
+		}
+
+		if bypass {
+			// bypass mode — execute immediately with formula defaults
+			side := exchange.OrderSideLong
+			if taResult.CurrentPrice < taResult.EMA200 {
+				side = exchange.OrderSideShort
+			}
+
+			sizeUSD := balance * 0.10 // 10% of balance
+			sizeUSD = math.Round(sizeUSD*100) / 100
+			leverage := 5
+
+			orderResult, err := b.exClient.PlaceLimitOrder(ctx, coin, side, sizeUSD, taResult.CurrentPrice, leverage)
+			if err != nil {
+				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Embeds: &[]*discordgo.MessageEmbed{{
+						Title:       fmt.Sprintf("❌ %s — Order Failed", coin),
+						Description: err.Error(),
+						Color:       ColorRed,
+					}},
+				})
+				return
+			}
+
+			b.SendEmbed(&discordgo.MessageEmbed{
+				Title:       fmt.Sprintf("⚡ %s %s EXECUTED (bypass)", coin, strings.ToUpper(string(side))),
+				Description: "Direct execution — no prefilter, no AI.",
+				Color:       ColorGreen,
+				Fields: []*discordgo.MessageEmbedField{
+					{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+					{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
+					{Name: "Leverage", Value: fmt.Sprintf("%dx cross", orderResult.Leverage), Inline: true},
+					{Name: "Side", Value: strings.ToUpper(string(side)), Inline: true},
+					{Name: "Price vs EMA200", Value: fmt.Sprintf("$%.4f vs $%.4f", taResult.CurrentPrice, taResult.EMA200), Inline: true},
+					{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
+				},
+				Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+				Timestamp: time.Now().Format(time.RFC3339),
+			})
+
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("⚡ %s %s EXECUTED (bypass)", coin, strings.ToUpper(string(side))),
+					Description: "Direct execution — no prefilter, no AI.",
+					Color:       ColorGreen,
+					Fields: []*discordgo.MessageEmbedField{
+						{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+						{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
+						{Name: "Leverage", Value: fmt.Sprintf("%dx cross", orderResult.Leverage), Inline: true},
+						{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
+					},
+					Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+					Timestamp: time.Now().Format(time.RFC3339),
+				}},
+			})
+			return
+		}
+
+		// full pipeline: prefilter + AI
+		filterResult := filter.ApplyPreFilter(coin, taResult, state)
+		if !filterResult.Pass {
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("⏭️ %s — Skipped", coin),
+					Description: filterResult.Reason,
+					Color:       ColorYellow,
+					Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
+					Timestamp:   time.Now().Format(time.RFC3339),
+				}},
+			})
+			return
+		}
+
+		score, err := b.scorer.Score(ctx, coin, taResult, mc, state)
+		if err != nil {
+			slog.Error("discord: /execute AI scoring failed", "coin", coin, "err", err)
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ %s — AI Error", coin),
+					Description: fmt.Sprintf("AI scoring failed: %s", err.Error()),
+					Color:       ColorRed,
+				}},
+			})
+			return
+		}
+
+		aiLog := &journal.AIDecisionLog{
+			Action:          score.Action,
+			Leverage:        score.Leverage,
+			PositionSizeUSD: score.PositionSizeUSD,
+			StopLoss:        score.StopLoss,
+			TakeProfit:      score.TakeProfit,
+			Confidence:      score.Confidence,
+			Strategy:        score.Strategy,
+			ConfluenceCount: score.ConfluenceCount,
+			RRRatio:         score.RRRatio,
+			Reasoning:       score.Reasoning,
+		}
+
+		b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
+			Timestamp:  journal.Now(),
+			Pair:       coin,
+			TA:         taResult,
+			Market:     mc,
+			AIDecision: aiLog,
+		})
+
+		if score.Action != "open_long" && score.Action != "open_short" {
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("⏸️ %s — %s", coin, strings.ToUpper(score.Action)),
+					Description: fmt.Sprintf("**Decision**: %s", score.Reasoning),
+					Color:       ColorYellow,
+					Fields: []*discordgo.MessageEmbedField{
+						{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
+						{Name: "Strategy", Value: score.Strategy, Inline: true},
+					},
+					Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+					Timestamp: time.Now().Format(time.RFC3339),
+				}},
+			})
+			return
+		}
+
+		// AI approved — place the order
+		var side exchange.OrderSide
+		if score.Action == "open_long" {
+			side = exchange.OrderSideLong
+		} else {
+			side = exchange.OrderSideShort
+		}
+
+		orderResult, err := b.exClient.PlaceLimitOrder(ctx, coin, side, score.PositionSizeUSD, taResult.CurrentPrice, score.Leverage)
+		if err != nil {
+			slog.Error("discord: /execute order failed", "coin", coin, "err", err)
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ %s — Order Failed", coin),
+					Description: err.Error(),
+					Color:       ColorRed,
+				}},
+			})
+			return
+		}
+
+		b.NotifyTradeExecuted(coin, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
+
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Embeds: &[]*discordgo.MessageEmbed{{
+				Title:       fmt.Sprintf("🚀 %s %s EXECUTED", coin, strings.ToUpper(strings.TrimPrefix(score.Action, "open_"))),
+				Description: fmt.Sprintf("**%s**", score.Reasoning),
+				Color:       ColorGreen,
+				Fields: []*discordgo.MessageEmbedField{
+					{Name: "Entry", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+					{Name: "SL", Value: fmt.Sprintf("$%.4f", score.StopLoss), Inline: true},
+					{Name: "TP", Value: fmt.Sprintf("$%.4f", score.TakeProfit), Inline: true},
+					{Name: "Size", Value: fmt.Sprintf("$%.2f", score.PositionSizeUSD), Inline: true},
+					{Name: "Leverage", Value: fmt.Sprintf("%dx cross", score.Leverage), Inline: true},
+					{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
+					{Name: "Strategy", Value: score.Strategy, Inline: true},
+					{Name: "R:R", Value: fmt.Sprintf("%.2f", score.RRRatio), Inline: true},
+					{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
+				},
+				Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+				Timestamp: time.Now().Format(time.RFC3339),
+			}},
+		})
+	}()
+}
+
 // refreshPairData fetches candles, calculates TA, and fetches market context for a pair.
 func (b *Bot) refreshPairData(ctx context.Context, pair string) (ta.TAResult, market.MarketContext, error) {
 	candles, err := b.fetcher.FetchOHLCV(ctx, pair, "4h", 200)
@@ -610,6 +849,7 @@ func (b *Bot) refreshPairData(ctx context.Context, pair string) (ta.TAResult, ma
 
 	return taResult, mc, nil
 }
+// handlePairs shows the current list of active trading pairs.
 func (b *Bot) handlePairs(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	pairs, err := market.LoadPairs()
 	if err != nil {

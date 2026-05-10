@@ -175,6 +175,24 @@ func (b *Bot) registerCommands() error {
 			Name:        "scan",
 			Description: "Scan the market for a good trade setup",
 		},
+		{
+			Name:        "execute",
+			Description: "Execute a trade — with or without AI analysis",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Name:        "coin",
+					Description: "Ticker symbol (e.g. SOL, BTC, ETH)",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    true,
+				},
+				{
+					Name:        "bypass",
+					Description: "Skip prefilter + AI — execute immediately with defaults (true/false)",
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Required:    false,
+				},
+			},
+		},
 	}
 
 	b.session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -203,6 +221,8 @@ func (b *Bot) registerCommands() error {
 			b.handlePairs(s, i)
 		case "scan":
 			b.handleScan(s, i)
+		case "execute":
+			b.handleExecute(s, i)
 		}
 	})
 
