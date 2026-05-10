@@ -7,7 +7,7 @@
 
 ## 📌 Overview
 
-Mambo AI Trade autonomously scans crypto pairs, performs technical analysis using the **techan** library + custom support/resistance detection, consults an AI trading agent, and executes cross margin limit orders on Hyperliquid Futures — all within a dynamic, balance-aware rule set. Supports multiple AI providers (Grok, OpenAI, DeepSeek, Anthropic) switchable via `.env`. You monitor and control everything through a private Discord bot with role-based access control.
+Mambo AI Trade autonomously scans crypto pairs, performs technical analysis using the **techan** library + custom support/resistance detection, runs an AI-powered **news sentiment scan** (CryptoPanic, CoinDesk, The Block, etc.), consults an AI trading agent, and executes cross margin limit orders on Hyperliquid Futures — all within a dynamic, balance-aware rule set. Supports multiple AI providers (Grok, OpenAI, DeepSeek, Anthropic) switchable via `.env`. You monitor and control everything through a private Discord bot with role-based access control.
 
 ---
 
@@ -15,10 +15,13 @@ Mambo AI Trade autonomously scans crypto pairs, performs technical analysis usin
 
 ```
 mambo/
-├── main.go
-├── pairs.json                  # Trading universe (edit freely)
+├── main.go                     # Entry point — wires all modules, Discord bot, monitor
+├── pairs.json                  # Legacy trading universe
+├── common_pairs.json           # Expanded trading universe (174+ pairs, 4H timeframe)
+├── analysis_log.json           # TA analysis log (per-cycle diagnostic dump)
 ├── AGENT.md                    # AI trader identity & rules (system prompt)
 ├── CLAUDE.md                   # Coding rules (auto-read by Claude CLI)
+├── news_research_agent.md      # News sentiment scan agent prompt + JSON spec
 ├── prompts/
 │   └── verify_trade.md         # Per-trade AI verification template
 ├── .env                        # All secrets + feature flags
@@ -26,7 +29,8 @@ mambo/
 ├── config/
 │   └── config.go               # Env loader, constants, multi-provider AI config
 ├── market/
-│   └── fetcher.go              # OHLCV + sentiment (alternative.me, Binance)
+│   ├── fetcher.go              # OHLCV + sentiment (alternative.me, Binance)
+│   └── pairs.go                # Load / get random pairs from pairs.json
 ├── ta/
 │   └── indicators.go           # techan wrapper + swing S/R detection
 ├── filter/
@@ -103,6 +107,26 @@ To switch provider: change `AI_PROVIDER` and set the matching API key. No code c
 
 ---
 
+## 📰 News Research Agent
+
+Before AI trade scoring, Mambo runs a **deep news sentiment scan** on the selected pair. The `news_research_agent.md` prompt instructs the AI to:
+
+- Scan **CryptoPanic, CoinDesk, The Block, Decrypt, CoinTelegraph** + financial/community sources
+- Assign a weighted sentiment score (-1.0 to +1.0)
+- Make a **gate decision**: `PASS` / `WARN` / `SKIP`
+- Output a machine-readable JSON report
+
+```
+Gate logic:
+  SKIP  → score ≤ -0.6, or any High-impact negative event (hack, SEC, delisting)
+  WARN  → score -0.3 to -0.59, or token unlock / whale movement detected
+  PASS  → score ≥ -0.29, no red flags
+```
+
+Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforcement, delisting, founder exit, network outage > 1h.
+
+---
+
 ## 📊 Technical Analysis
 
 | Indicator | Source |
@@ -164,22 +188,26 @@ To switch provider: change `AI_PROVIDER` and set the matching API key. No code c
    ❌ Daily loss ≥ 15%         → skip all
    ❌ Capital at risk ≥ 60%    → skip all
 
-6. ENRICH CONTEXT (free APIs)
+6. NEWS RESEARCH (AI-powered deep scan)
+   CryptoPanic, CoinDesk, The Block, Decrypt, CoinTelegraph, social
+   → PASS / WARN / SKIP gate decision
+
+7. ENRICH CONTEXT (free APIs)
    Fear & Greed, Funding rate, OI, Long/Short ratio
 
-7. AI SCORING (configured provider)
-   Input: all TA + S/R + market context + portfolio state
+8. AI SCORING (configured provider)
+   Input: all TA + S/R + news gate + market context + portfolio state
    Output: EXECUTE/ABORT + size + leverage + strategy
 
-8. VALIDATE + CLAMP (Go code — AI cannot bypass)
+9. VALIDATE + CLAMP (Go code — AI cannot bypass)
    confidence < 85% → reject
    R:R < 3.0 → reject
    size: 5–20%, leverage: 1–10x
 
-9. ORDER EXECUTION
+10. ORDER EXECUTION
    Limit order, cross margin, 10min auto-cancel
 
-10. MONITOR (two tickers)
+11. MONITOR (two tickers)
     priceTicker (MonitorPriceSec) → TP/SL/hard rules
     aiTicker    (MonitorAISec)    → AI position analysis
 ```
@@ -225,12 +253,13 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 ```
 Layer 1  Trend + S/R Gate (Go)         EMA spread < 0.2% → skip
 Layer 2  Pre-filter Rules (Go)          RSI, EMA, volume, budget
-Layer 3  AI Trade Scoring               confidence ≥ 85%, R:R ≥ 3.0, S/R aware
-Layer 4  Output Clamp (Go)             size 5–20%, leverage 1–10x
-Layer 5  Order Safety (Go)             limit only, 10min auto-cancel
-Layer 6  Position Hard Rules (Go)      drawdown, max hold, smart loss cut
-Layer 7  AI Position Management        hold/close/move SL/TP, S/R aware
-Layer 8  Discord Role Auth (Go)        only authorized role can interact
+Layer 3  News Sentiment Gate (AI)       SKIP on exploits, hacks, SEC; WARN on unlocks, whales
+Layer 4  AI Trade Scoring               confidence ≥ 85%, R:R ≥ 3.0, S/R aware
+Layer 5  Output Clamp (Go)             size 5–20%, leverage 1–10x
+Layer 6  Order Safety (Go)             limit only, 10min auto-cancel
+Layer 7  Position Hard Rules (Go)      drawdown, max hold, smart loss cut
+Layer 8  AI Position Management        hold/close/move SL/TP, S/R aware
+Layer 9  Discord Role Auth (Go)        only authorized role can interact
 ```
 
 ---
@@ -246,6 +275,7 @@ Layer 8  Discord Role Auth (Go)        only authorized role can interact
 | Discord | `github.com/bwmarrin/discordgo` |
 | Env loading | `github.com/joho/godotenv` |
 | Sentiment | alternative.me + Binance Public API (free) |
+| News Research | AI-powered multi-source scan (CryptoPanic, CoinDesk, The Block, etc.) |
 
 ---
 
@@ -272,8 +302,12 @@ Phase C  ✅  TA (techan) + S/R detection
 Phase D  ✅  Pre-filter + AI scorer (multi-provider)
 Phase E  ✅  Journal
 Phase F  ✅  Position monitor (two-ticker)
-Phase G  🔜  Discord bot
-Phase H  🔜  Main scan loop
+Phase G  ✅  Discord bot (slash commands, embeds, role auth)
+Phase H  ✅  Main scan loop (full wiring)
+
+Extras  ✅  News research agent (sentiment scan + gate decision)
+         ✅  Expanded pairs universe (174+ coins in common_pairs.json)
+         ✅  Analysis log (per-cycle TA dump to analysis_log.json)
 
 Phase 2 (later):
   → Top Gainers/Losers 24h (Asterdex API)

@@ -14,6 +14,7 @@ require (
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20260416073033-7c2071eaa8d4 // indirect
 	github.com/armon/go-radix v1.0.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
+	github.com/bwmarrin/discordgo v0.29.0 // indirect
 	github.com/consensys/gnark-crypto v0.20.1 // indirect
 	github.com/crate-crypto/go-eth-kzg v1.5.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -41,6 +42,7 @@ require (
 	go.elastic.co/apm/module/apmzerolog/v2 v2.7.8 // indirect
 	go.elastic.co/apm/v2 v2.7.8 // indirect
 	go.elastic.co/fastjson v1.5.1 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

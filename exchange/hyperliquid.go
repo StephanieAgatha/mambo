@@ -49,9 +49,10 @@ type Position struct {
 // info is used for all read-only queries (balance, positions, candles).
 // ex is used for all write operations (orders, leverage, cancel).
 type Client struct {
-	info *hyperliquid.Info
-	ex   *hyperliquid.Exchange
-	cfg  *config.Config
+	info       *hyperliquid.Info
+	ex         *hyperliquid.Exchange
+	cfg        *config.Config
+	szDecimals map[string]int // pair → szDecimals, cached after first fetch
 }
 
 // New initializes both the Info (read) and Exchange (write) SDK clients
@@ -107,22 +108,20 @@ func New(ctx context.Context, cfg *config.Config) (*Client, error) {
 	)
 
 	return &Client{
-		info: info,
-		ex:   ex,
-		cfg:  cfg,
+		info:       info,
+		ex:         ex,
+		cfg:        cfg,
+		szDecimals: make(map[string]int),
 	}, nil
 }
 
 // FetchBalance returns the available USDC balance from spot wallet.
-// This is the actual USDC balance available for trading, not the perp account value.
 func (c *Client) FetchBalance(ctx context.Context) (float64, error) {
-	// Get spot balances to find USDC balance
 	spotState, err := c.info.SpotUserState(ctx, c.cfg.AccountAddress)
 	if err != nil {
 		return 0, fmt.Errorf("exchange: fetch spot balance failed account=%s: %w", c.cfg.AccountAddress, err)
 	}
 
-	// Find USDC balance in spot balances
 	var usdcBalance float64
 	foundUSDC := false
 
@@ -140,7 +139,6 @@ func (c *Client) FetchBalance(ctx context.Context) (float64, error) {
 	}
 
 	if !foundUSDC {
-		// Fallback to perp account value if USDC not found in spot balances
 		state, err := c.info.UserState(ctx, c.cfg.AccountAddress)
 		if err != nil {
 			return 0, fmt.Errorf("exchange: fetch perp balance failed account=%s: %w", c.cfg.AccountAddress, err)
@@ -168,7 +166,6 @@ func (c *Client) FetchBalance(ctx context.Context) (float64, error) {
 }
 
 // FetchPositions returns all open perp positions for the main account.
-// Positions with zero size are skipped.
 func (c *Client) FetchPositions(ctx context.Context) ([]Position, error) {
 	state, err := c.info.UserState(ctx, c.cfg.AccountAddress)
 	if err != nil {
@@ -180,13 +177,11 @@ func (c *Client) FetchPositions(ctx context.Context) ([]Position, error) {
 	for _, ap := range state.AssetPositions {
 		pos := ap.Position
 
-		// sonirico SDK: Szi is a raw string — negative = short, positive = long
 		szi, err := strconv.ParseFloat(pos.Szi, 64)
 		if err != nil {
 			return nil, fmt.Errorf("exchange: parse Szi %q for %s: %w", pos.Szi, pos.Coin, err)
 		}
 
-		// skip positions with zero or near-zero size
 		if math.Abs(szi) < 1e-9 {
 			continue
 		}
@@ -196,7 +191,6 @@ func (c *Client) FetchPositions(ctx context.Context) ([]Position, error) {
 			side = OrderSideShort
 		}
 
-		// EntryPx is *string — nil means position has no entry price yet
 		var entryPrice float64
 		if pos.EntryPx != nil {
 			entryPrice, err = strconv.ParseFloat(*pos.EntryPx, 64)
@@ -215,7 +209,6 @@ func (c *Client) FetchPositions(ctx context.Context) ([]Position, error) {
 			return nil, fmt.Errorf("exchange: parse UnrealizedPnl %q for %s: %w", pos.UnrealizedPnl, pos.Coin, err)
 		}
 
-		// LiquidationPx is *string — nil if no liquidation price set
 		var liqPx float64
 		if pos.LiquidationPx != nil {
 			liqPx, err = strconv.ParseFloat(*pos.LiquidationPx, 64)
@@ -244,8 +237,6 @@ func (c *Client) FetchPositions(ctx context.Context) ([]Position, error) {
 }
 
 // PlaceLimitOrder places a cross margin limit order on Hyperliquid.
-// sizeUSD is the notional value in USDC. Price is the limit price.
-// Leverage is set via UpdateLeverage before placing the order.
 func (c *Client) PlaceLimitOrder(
 	ctx context.Context,
 	pair string,
@@ -261,18 +252,22 @@ func (c *Client) PlaceLimitOrder(
 	isBuy := side == OrderSideLong
 	sizeCoins := sizeUSD / price
 
+	// round size to the pair's szDecimals to avoid Hyperliquid rounding errors
+	decimals := c.szDecimalsForPair(ctx, pair)
+	roundFactor := math.Pow(10, float64(decimals))
+	sizeCoins = math.Round(sizeCoins*roundFactor) / roundFactor
+
 	req := hyperliquid.CreateOrderRequest{
 		Coin:  pair,
 		IsBuy: isBuy,
-		Size:  sizeCoins, // was Sz
-		Price: price,     // was LimitPx
+		Size:  sizeCoins,
+		Price: price,
 		OrderType: hyperliquid.OrderType{
 			Limit: &hyperliquid.LimitOrderType{Tif: "Gtc"},
 		},
 		ReduceOnly: false,
 	}
 
-	// The 2nd arg is *BuilderInfo — pass nil (no vault, no custom nonce)
 	resp, err := c.ex.Order(ctx, req, nil)
 	if err != nil {
 		return OrderResult{}, fmt.Errorf("exchange: place limit order failed pair=%s side=%s price=%.4f: %w",
@@ -309,7 +304,6 @@ func (c *Client) PlaceLimitOrder(
 }
 
 // CancelOrder cancels an open order by its order ID.
-// CancelOrder cancels an open order by its order ID.
 func (c *Client) CancelOrder(ctx context.Context, pair string, orderID uint64) error {
 	if _, err := c.ex.Cancel(ctx, pair, int64(orderID)); err != nil {
 		return fmt.Errorf("exchange: cancel order failed pair=%s order_id=%d: %w", pair, orderID, err)
@@ -323,16 +317,15 @@ func (c *Client) CancelOrder(ctx context.Context, pair string, orderID uint64) e
 }
 
 // ClosePosition closes an open position using a reduce-only market order.
-// Used by the monitor goroutine when TP/SL/hard rules trigger.
 func (c *Client) ClosePosition(ctx context.Context, pair string, side OrderSide) error {
-	isBuy := side == OrderSideShort // closing long = sell, closing short = buy
+	isBuy := side == OrderSideShort
 
 	req := hyperliquid.CreateOrderRequest{
 		Coin:       pair,
 		IsBuy:      isBuy,
-		Size:       0,                       // 0 + ReduceOnly = close entire position
-		Price:      0,                       // 0 = market order
-		OrderType:  hyperliquid.OrderType{}, // no limit fields → market
+		Size:       0,
+		Price:      0,
+		OrderType:  hyperliquid.OrderType{},
 		ReduceOnly: true,
 	}
 
@@ -349,7 +342,6 @@ func (c *Client) ClosePosition(ctx context.Context, pair string, side OrderSide)
 }
 
 // FetchCurrentPrice returns the current mid price for a pair using AllMids.
-// Used by the monitor goroutine to check TP/SL conditions every 10 seconds.
 func (c *Client) FetchCurrentPrice(ctx context.Context, pair string) (float64, error) {
 	mids, err := c.info.AllMids(ctx)
 	if err != nil {
@@ -367,4 +359,28 @@ func (c *Client) FetchCurrentPrice(ctx context.Context, pair string) (float64, e
 	}
 
 	return price, nil
+}
+
+// szDecimalsForPair returns the size decimals for a given pair.
+// Cached after first fetch from Hyperliquid metadata.
+func (c *Client) szDecimalsForPair(ctx context.Context, pair string) int {
+	if d, ok := c.szDecimals[pair]; ok {
+		return d
+	}
+
+	meta, err := c.info.Meta(ctx)
+	if err != nil {
+		slog.Warn("exchange: fetch meta failed — defaulting to 0 szDecimals", "err", err)
+		return 0
+	}
+
+	for _, asset := range meta.Universe {
+		c.szDecimals[asset.Name] = asset.SzDecimals
+	}
+
+	d, ok := c.szDecimals[pair]
+	if !ok {
+		return 0
+	}
+	return d
 }
