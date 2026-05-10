@@ -69,7 +69,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	discordBot, err := discord.New(cfg, scorer, fetcher, jl, exClient)
+	// create Discord bot first (pass nil monitor, set after)
+	discordBot, err := discord.New(cfg, scorer, fetcher, jl, exClient, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "discord error: %v\n", err)
 		os.Exit(1)
@@ -80,7 +81,6 @@ func main() {
 	onClose := func(pos journal.OpenPosition, exitPrice float64, reason monitor.CloseReason, pnlUSD, pnlPct float64) {
 		discordBot.NotifyPositionClosed(pos.Pair, string(pos.Direction), pos.EntryPrice, exitPrice, pnlUSD, pnlPct, string(reason), pos.Strategy)
 	}
-
 	onUpdate := func(pos journal.OpenPosition, action string, newSL, newTP float64, reasoning string) {
 		discordBot.NotifyPositionUpdated(pos.Pair, action, newSL, newTP, reasoning)
 	}
@@ -89,6 +89,9 @@ func main() {
 	for _, pos := range openPositions {
 		mon.Start(ctx, pos)
 	}
+
+	// wire monitor into Discord bot for /execute auto-start
+	discordBot.SetMonitor(mon)
 
 	fmt.Println("Mambo Discord Bot is running. Press Ctrl+C to stop.")
 	discordBot.SendEmbed(&discordgo.MessageEmbed{

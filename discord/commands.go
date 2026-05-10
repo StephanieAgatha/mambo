@@ -644,6 +644,10 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 						return
 					}
 
+					dummySL := taResult.CurrentPrice - taResult.ATR*3
+					dummyTP := taResult.CurrentPrice + taResult.ATR*6
+					b.StartMonitor(ctx, pair, exchange.OrderSideLong, orderResult.Price, balance*0.10, config.MaxLeverageX, dummySL, dummyTP, 0, "dummy", "AI disabled scan", orderResult.OrderID)
+
 					b.SendEmbed(&discordgo.MessageEmbed{
 						Title:       fmt.Sprintf("🚀 DUMMY ORDER — %s", pair),
 						Description: "AI disabled. Executed dummy LONG with 10% balance at 10x.",
@@ -844,16 +848,27 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 				return
 			}
 
+			// bypass SL/TP: 3x ATR stop, 6x ATR target
+			bypassSL := taResult.CurrentPrice - taResult.ATR*3
+			bypassTP := taResult.CurrentPrice + taResult.ATR*6
+			if side == exchange.OrderSideShort {
+				bypassSL = taResult.CurrentPrice + taResult.ATR*3
+				bypassTP = taResult.CurrentPrice - taResult.ATR*6
+			}
+
+			b.StartMonitor(ctx, coin, side, orderResult.Price, sizeUSD, leverage, bypassSL, bypassTP, 0, "bypass", "direct execution", orderResult.OrderID)
+
 			b.SendEmbed(&discordgo.MessageEmbed{
 				Title:       fmt.Sprintf("⚡ %s %s EXECUTED (bypass)", coin, strings.ToUpper(string(side))),
 				Description: "Direct execution — no prefilter, no AI.",
 				Color:       ColorGreen,
 				Fields: []*discordgo.MessageEmbedField{
 					{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+					{Name: "SL", Value: fmt.Sprintf("$%.4f", bypassSL), Inline: true},
+					{Name: "TP", Value: fmt.Sprintf("$%.4f", bypassTP), Inline: true},
 					{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
 					{Name: "Leverage", Value: fmt.Sprintf("%dx cross", orderResult.Leverage), Inline: true},
 					{Name: "Side", Value: strings.ToUpper(string(side)), Inline: true},
-					{Name: "Price vs EMA200", Value: fmt.Sprintf("$%.4f vs $%.4f", taResult.CurrentPrice, taResult.EMA200), Inline: true},
 					{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
 				},
 				Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
@@ -863,10 +878,12 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 				Embeds: &[]*discordgo.MessageEmbed{{
 					Title:       fmt.Sprintf("⚡ %s %s EXECUTED (bypass)", coin, strings.ToUpper(string(side))),
-					Description: "Direct execution — no prefilter, no AI.",
+					Description: "Direct execution — no prefilter, no AI. Monitor active.",
 					Color:       ColorGreen,
 					Fields: []*discordgo.MessageEmbedField{
 						{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+						{Name: "SL", Value: fmt.Sprintf("$%.4f", bypassSL), Inline: true},
+						{Name: "TP", Value: fmt.Sprintf("$%.4f", bypassTP), Inline: true},
 						{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
 						{Name: "Leverage", Value: fmt.Sprintf("%dx cross", orderResult.Leverage), Inline: true},
 						{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
@@ -966,6 +983,8 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 		}
 
 		b.NotifyTradeExecuted(coin, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
+
+		b.StartMonitor(ctx, coin, side, orderResult.Price, score.PositionSizeUSD, score.Leverage, score.StopLoss, score.TakeProfit, score.Confidence, score.Strategy, score.Reasoning, orderResult.OrderID)
 
 		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 			Embeds: &[]*discordgo.MessageEmbed{{

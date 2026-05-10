@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -10,6 +11,7 @@ import (
 	"mambo/exchange"
 	"mambo/journal"
 	"mambo/market"
+	"mambo/monitor"
 	aiPkg "mambo/ai"
 )
 
@@ -21,6 +23,7 @@ type Bot struct {
 	fetcher  *market.Fetcher
 	jl       *journal.Logger
 	exClient *exchange.Client
+	mon      *monitor.Monitor
 	mode     string // "auto" | "manual"
 }
 
@@ -45,6 +48,7 @@ func New(
 	fetcher *market.Fetcher,
 	jl *journal.Logger,
 	exClient *exchange.Client,
+	mon *monitor.Monitor,
 ) (*Bot, error) {
 	if cfg.DiscordBotToken == "" {
 		return nil, fmt.Errorf("discord: DISCORD_BOT_TOKEN not set")
@@ -68,6 +72,7 @@ func New(
 		fetcher:  fetcher,
 		jl:       jl,
 		exClient: exClient,
+		mon:      mon,
 		mode:     "auto",
 	}
 
@@ -87,6 +92,52 @@ func New(
 // GetMode returns the current trading mode.
 func (b *Bot) GetMode() string {
 	return b.mode
+}
+
+// SetMonitor wires the position monitor into the bot for auto-starting on /execute.
+func (b *Bot) SetMonitor(mon *monitor.Monitor) {
+	b.mon = mon
+}
+
+// StartMonitor saves the position and spawns the monitor goroutine.
+func (b *Bot) StartMonitor(ctx context.Context, pair string, direction exchange.OrderSide, entryPrice, sizeUSD float64, leverage int, stopLoss, takeProfit, confidence float64, strategy, aiReason string, orderID uint64) {
+	if b.mon == nil {
+		slog.Warn("discord: monitor not wired — position not monitored", "pair", pair)
+		return
+	}
+
+	pos := journal.OpenPosition{
+		ID:         journal.GeneratePositionID(),
+		Pair:       pair,
+		Direction:  direction,
+		EntryPrice: entryPrice,
+		SizeUSD:    sizeUSD,
+		Leverage:   leverage,
+		StopLoss:   stopLoss,
+		TakeProfit: takeProfit,
+		Confidence: confidence,
+		Strategy:   strategy,
+		AIReason:   aiReason,
+		OrderID:    orderID,
+		OpenedAt:   journal.Now(),
+		Status:     "open",
+	}
+
+	if err := b.jl.SavePosition(pos); err != nil {
+		slog.Error("discord: save position failed", "pos_id", pos.ID, "pair", pair, "err", err)
+		return
+	}
+
+	b.mon.Start(ctx, pos)
+
+	slog.Info("discord: position monitor started",
+		"pos_id", pos.ID,
+		"pair", pair,
+		"direction", direction,
+		"entry", entryPrice,
+		"sl", stopLoss,
+		"tp", takeProfit,
+	)
 }
 
 // Close gracefully shuts down the Discord session.
