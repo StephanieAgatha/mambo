@@ -44,16 +44,16 @@ mambo/
 ├── monitor/
 │   └── position.go             # Two-ticker goroutine (price + AI intervals)
 ├── discord/
-│   ├── bot.go                  # Init, slash commands, role auth
+│   ├── bot.go                  # Init, slash commands, role auth, StartMonitor
 │   ├── notify.go               # Embed notifications + motivational quotes
-│   ├── commands.go             # Slash command handlers
+│   ├── commands.go             # Slash command handlers (/check, /execute, /journal, /pnl, etc.)
 │   └── checker.go              # /check coin:SOL handler
 ├── journal/
-│   └── logger.go               # positions.json + journal.json
+│   └── logger.go               # positions.json + journal.json (local recovery log)
 ├── logger/
 │   └── logger.go               # Color slog handler
 ├── positions.json              # Open positions (recovery on restart)
-└── journal.json                # Closed trades history
+└── journal.json                # Closed trades history (local backup, /journal uses live API)
 ```
 
 ---
@@ -206,10 +206,12 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 
 10. ORDER EXECUTION
    Limit order, cross margin, 10min auto-cancel
+   Auto-saves position → spawns monitor goroutine
 
-11. MONITOR (two tickers)
+11. MONITOR (two tickers, starts automatically)
     priceTicker (MonitorPriceSec) → TP/SL/hard rules
     aiTicker    (MonitorAISec)    → AI position analysis
+    Auto-closes position → Discord notification → logged to journal.json
 ```
 
 ---
@@ -241,9 +243,10 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 /execute coin:SOL bypass:true → skip prefilter + AI, execute immediately with defaults
 /scan                      → scan random pairs for trade setup (auto-retry 3×, 3min delay)
 /status                    → open positions + live PnL
-/journal                   → today's trades
+/journal                   → today's trades (live from Hyperliquid, paginated)
 /journal week              → last 7 days
-/pnl                       → total PnL + win rate
+/journal week page:2       → page 2 of 7-day journal
+/pnl                       → total PnL + per-coin breakdown (live from Hyperliquid)
 /mode  auto|manual         → toggle mode
 /capital                   → balance + limits + budget
 /pairs                     → active pairs
