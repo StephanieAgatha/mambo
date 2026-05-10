@@ -10,11 +10,11 @@ import (
 
 // BotState holds the current daily trading state needed for pre-filter decisions.
 type BotState struct {
-	Balance            float64 // live balance from Hyperliquid
-	DailyLossUSD       float64 // total loss realized today
-	DailyWinUSD        float64 // total profit realized today
-	ConsecutiveLosses  int     // consecutive losses without a win
-	TotalAtRiskUSD     float64 // total USD currently deployed in open positions
+	Balance           float64 // live balance from Hyperliquid
+	DailyLossUSD      float64 // total loss realized today
+	DailyWinUSD       float64 // total profit realized today
+	ConsecutiveLosses int     // consecutive losses without a win
+	TotalAtRiskUSD    float64 // total USD currently deployed in open positions
 }
 
 // FilterResult is the outcome of ApplyPreFilter.
@@ -34,7 +34,7 @@ func ApplyPreFilter(pair string, result ta.TAResult, state BotState) FilterResul
 		slog.Debug("pre-filter: DISABLED — all pairs pass")
 		return FilterResult{Pass: true, SkipAll: false, Reason: "pre-filter disabled"}
 	}
-	
+
 	// daily loss limit: 15% of balance
 	dailyLossLimit := state.Balance * config.DailyLossLimitPct
 	if state.DailyLossUSD >= dailyLossLimit {

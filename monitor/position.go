@@ -94,7 +94,7 @@ func (m *Monitor) Start(ctx context.Context, pos journal.OpenPosition) {
 //   - aiTicker   : cfg.MonitorAISec     → call Grok for analysis (slower, configurable)
 func (m *Monitor) watch(ctx context.Context, pos journal.OpenPosition) {
 	priceTicker := time.NewTicker(time.Duration(m.cfg.MonitorPriceSec) * time.Second)
-	aiTicker    := time.NewTicker(time.Duration(m.cfg.MonitorAISec) * time.Second)
+	aiTicker := time.NewTicker(time.Duration(m.cfg.MonitorAISec) * time.Second)
 	defer priceTicker.Stop()
 	defer aiTicker.Stop()
 

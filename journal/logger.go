@@ -9,38 +9,41 @@ import (
 	"time"
 
 	"mambo/exchange"
+	"mambo/market"
+	"mambo/ta"
 )
 
 const (
-	positionsFile = "positions.json"
-	journalFile   = "journal.json"
+	positionsFile   = "positions.json"
+	journalFile     = "journal.json"
+	analysisLogFile = "analysis_log.json"
 )
 
 // OpenPosition represents an active futures position being monitored.
 // Saved to positions.json so the monitor goroutine can recover after bot restart.
 type OpenPosition struct {
-	ID            string            `json:"id"`             // unique: "pos_<unix_timestamp>"
-	Pair          string            `json:"pair"`
-	Direction     exchange.OrderSide `json:"direction"`      // "long" / "short"
-	EntryPrice    float64           `json:"entry_price"`
-	SizeUSD       float64           `json:"size_usd"`
-	Leverage      int               `json:"leverage"`
-	StopLoss      float64           `json:"stop_loss"`
-	TakeProfit    float64           `json:"take_profit"`
-	PeakPnLPct    float64           `json:"peak_pnl_pct"`   // highest PnL% ever reached
-	Confidence    float64           `json:"confidence"`
-	Strategy      string            `json:"strategy"`
-	AIReason      string            `json:"ai_reason"`
-	OrderID       uint64            `json:"order_id"`
-	OpenedAt      string            `json:"opened_at"`       // RFC3339 with timezone
-	Status        string            `json:"status"`          // "open" / "filled" / "cancelled"
+	ID         string             `json:"id"` // unique: "pos_<unix_timestamp>"
+	Pair       string             `json:"pair"`
+	Direction  exchange.OrderSide `json:"direction"` // "long" / "short"
+	EntryPrice float64            `json:"entry_price"`
+	SizeUSD    float64            `json:"size_usd"`
+	Leverage   int                `json:"leverage"`
+	StopLoss   float64            `json:"stop_loss"`
+	TakeProfit float64            `json:"take_profit"`
+	PeakPnLPct float64            `json:"peak_pnl_pct"` // highest PnL% ever reached
+	Confidence float64            `json:"confidence"`
+	Strategy   string             `json:"strategy"`
+	AIReason   string             `json:"ai_reason"`
+	OrderID    uint64             `json:"order_id"`
+	OpenedAt   string             `json:"opened_at"` // RFC3339 with timezone
+	Status     string             `json:"status"`    // "open" / "filled" / "cancelled"
 }
 
 // ClosedTrade represents a completed trade written to journal.json.
 type ClosedTrade struct {
 	ID          string             `json:"id"`
 	Pair        string             `json:"pair"`
-	Direction   exchange.OrderSide  `json:"direction"`
+	Direction   exchange.OrderSide `json:"direction"`
 	EntryPrice  float64            `json:"entry_price"`
 	ExitPrice   float64            `json:"exit_price"`
 	SizeUSD     float64            `json:"size_usd"`
@@ -397,5 +400,67 @@ func (l *Logger) writeJournal(store journalStore) error {
 	if err := os.WriteFile(journalFile, data, 0644); err != nil {
 		return fmt.Errorf("write %s: %w", journalFile, err)
 	}
+	return nil
+}
+
+// AnalysisLogEntry is a single line written to analysis_log.jsonl for every
+// pair that passes pre-filter and gets sent to AI.
+type AnalysisLogEntry struct {
+	Timestamp string         `json:"timestamp"`
+	Pair      string         `json:"pair"`
+	TA        ta.TAResult    `json:"ta"`
+	Market    market.MarketContext `json:"market_context"`
+	AIDecision *AIDecisionLog `json:"ai_decision,omitempty"`
+	AIError    string         `json:"ai_error,omitempty"`
+}
+
+// AIDecisionLog mirrors the parsed AI decision for logging.
+type AIDecisionLog struct {
+	Action          string  `json:"action"`
+	Leverage        int     `json:"leverage"`
+	PositionSizeUSD float64 `json:"position_size_usd"`
+	StopLoss        float64 `json:"stop_loss"`
+	TakeProfit      float64 `json:"take_profit"`
+	Confidence      float64 `json:"confidence"`
+	Strategy        string  `json:"strategy"`
+	ConfluenceCount int     `json:"confluence_count"`
+	RRRatio         float64 `json:"rr_ratio"`
+	Reasoning       string  `json:"reasoning"`
+}
+
+// analysisLogStore is the top-level wrapper for analysis_log.json
+type analysisLogStore struct {
+	Entries []AnalysisLogEntry `json:"entries"`
+}
+
+// AppendAnalysisLog appends an entry to analysis_log.json as a properly formatted
+// JSON array. Reads the existing file, appends the new entry, and rewrites.
+func (l *Logger) AppendAnalysisLog(entry AnalysisLogEntry) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	store := analysisLogStore{Entries: []AnalysisLogEntry{}}
+
+	// read existing entries if file exists
+	data, err := os.ReadFile(analysisLogFile)
+	if err == nil {
+		if err := json.Unmarshal(data, &store); err != nil {
+			// corrupted file? start fresh
+			slog.Warn("journal: analysis_log.json corrupted — starting fresh", "err", err)
+			store.Entries = []AnalysisLogEntry{}
+		}
+	}
+
+	store.Entries = append(store.Entries, entry)
+
+	pretty, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return fmt.Errorf("journal: marshal analysis log %s: %w", entry.Pair, err)
+	}
+
+	if err := os.WriteFile(analysisLogFile, pretty, 0644); err != nil {
+		return fmt.Errorf("journal: write analysis log %s: %w", entry.Pair, err)
+	}
+
 	return nil
 }

@@ -1,4 +1,4 @@
-package main
+package discord
 
 import (
 	"context"
@@ -31,7 +31,7 @@ func main() {
 
 	slog.Info("config loaded",
 		"network", cfg.NetworkLabel(),
-		"ai_model", config.GrokModel,
+		"ai_model", cfg.AILabel(),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -127,24 +127,34 @@ func main() {
 		"monitoring", len(openPositions),
 	)
 
-	// ── Test Phase B+C+D for SOL ──────────────────────────────────────────────
-	candles, err := fetcher.FetchOHLCV(ctx, "SOL", "4h", 200)
+	// ── Test Phase B+C+D for random pair from pairs.json ──────────────────────
+	// Get random pair from pairs.json
+	randomPair, err := market.GetRandomPair()
 	if err != nil {
-		slog.Error("failed to fetch OHLCV", "err", err)
+		slog.Error("failed to get random pair", "err", err)
 		os.Exit(1)
 	}
 
-	mc, err := fetcher.FetchMarketContext(ctx, "SOL")
+	slog.Info("Selected random pair for analysis", "pair", randomPair)
+
+	candles, err := fetcher.FetchOHLCV(ctx, randomPair, "4h", 200)
 	if err != nil {
-		slog.Warn("market context unavailable", "err", err)
+		slog.Error("failed to fetch OHLCV", "pair", randomPair, "err", err)
+		os.Exit(1)
+	}
+
+	mc, err := fetcher.FetchMarketContext(ctx, randomPair)
+	if err != nil {
+		slog.Warn("market context unavailable", "pair", randomPair, "err", err)
 	}
 
 	taResult, err := ta.Calculate(candles)
 	if err != nil {
-		slog.Error("failed to calculate TA", "err", err)
+		slog.Error("failed to calculate TA", "pair", randomPair, "err", err)
 		os.Exit(1)
 	}
 	slog.Info("✅ TA calculated",
+		"pair", randomPair,
 		"price", taResult.CurrentPrice,
 		"rsi", fmt.Sprintf("%.2f", taResult.RSI),
 		"ribbon", taResult.RibbonStatus,
@@ -164,17 +174,18 @@ func main() {
 		TotalAtRiskUSD:    0,
 	}
 
-	filterResult := filter.ApplyPreFilter("SOL", taResult, state)
+	filterResult := filter.ApplyPreFilter(randomPair, taResult, state)
 	if !filterResult.Pass {
-		slog.Warn("pre-filter: skip", "pair", "SOL", "reason", filterResult.Reason)
+		slog.Warn("pre-filter: skip", "pair", randomPair, "reason", filterResult.Reason)
 	} else {
-		slog.Info("✅ pre-filter passed", "pair", "SOL")
+		slog.Info("✅ pre-filter passed", "pair", randomPair)
 
-		score, err := scorer.Score(ctx, "SOL", taResult, mc, state)
+		score, err := scorer.Score(ctx, randomPair, taResult, mc, state)
 		if err != nil {
-			slog.Error("AI scoring failed", "err", err)
+			slog.Error("AI scoring failed", "pair", randomPair, "err", err)
 		} else {
 			slog.Info("✅ AI score",
+				"pair", randomPair,
 				"action", score.Action,
 				"confidence", score.Confidence,
 				"size_usd", score.PositionSizeUSD,

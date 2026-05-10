@@ -20,7 +20,7 @@ import (
 // ScoreResult holds the parsed AI decision for a trade setup.
 type ScoreResult struct {
 	Symbol          string
-	Action          string  // "open_long" / "open_short" / "hold" / "wait"
+	Action          string // "open_long" / "open_short" / "hold" / "wait"
 	Leverage        int
 	PositionSizeUSD float64
 	StopLoss        float64

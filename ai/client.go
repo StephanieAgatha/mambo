@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"mambo/config"
@@ -60,7 +61,7 @@ func (c *Client) chatOpenAICompatible(ctx context.Context, systemPrompt, userPro
 		return "", fmt.Errorf("ai/client: marshal request: %w", err)
 	}
 
-	url := c.cfg.AIBaseURL + "/chat/completions"
+	url := strings.TrimRight(c.cfg.AIBaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("ai/client: build request provider=%s: %w", c.cfg.AIProvider, err)
@@ -125,7 +126,7 @@ func (c *Client) chatAnthropic(ctx context.Context, systemPrompt, userPrompt str
 		return "", fmt.Errorf("ai/client: anthropic marshal request: %w", err)
 	}
 
-	url := c.cfg.AIBaseURL + "/v1/messages"
+	url := strings.TrimRight(c.cfg.AIBaseURL, "/") + "/v1/messages"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("ai/client: anthropic build request: %w", err)

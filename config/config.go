@@ -11,9 +11,9 @@ import (
 // Guardrail constants — never hardcode dollar amounts, always use percentages
 const (
 	// Position sizing
-	MinSizePct          = 0.05  // 5% of balance per trade minimum
-	MaxSizePct          = 0.20  // 20% of balance per trade maximum
-	MaxCapitalAtRiskPct = 0.60  // 60% of balance max deployed across all positions
+	MinSizePct          = 0.05 // 5% of balance per trade minimum
+	MaxSizePct          = 0.20 // 20% of balance per trade maximum
+	MaxCapitalAtRiskPct = 0.60 // 60% of balance max deployed across all positions
 
 	// Leverage
 	MinLeverageX = 1  // 1x cross minimum
@@ -54,16 +54,16 @@ const (
 var providerBaseURLs = map[string]string{
 	ProviderGrok:     "https://api.x.ai/v1",
 	ProviderOpenAI:   "https://api.openai.com/v1",
-	ProviderDeepSeek: "https://agentrouter.org/",
+	ProviderDeepSeek: "https://hyper.charm.land/v1",
 	// Anthropic uses a different API format — handled in ai/client.go
-	ProviderAnthropic: "https://agentrouter.org/",
+	ProviderAnthropic: "https://api.anthropic.com",
 }
 
 // defaultModels maps provider name → recommended default model.
 var defaultModels = map[string]string{
 	ProviderGrok:      "grok-4.20-0309-reasoning",
 	ProviderOpenAI:    "gpt-4o",
-	ProviderDeepSeek:  "deepseek-v3.2",
+	ProviderDeepSeek:  "deepseek-v4-pro",
 	ProviderAnthropic: "claude-opus-4-5",
 }
 
@@ -76,10 +76,10 @@ type Config struct {
 	HyperliquidAPIURL string // derived from Testnet flag
 
 	// AI Provider (configurable)
-	AIProvider    string // "grok" | "openai" | "deepseek" | "anthropic"
-	AIModel       string // model name — defaults to provider's recommended model
-	AIBaseURL     string // derived from AIProvider
-	AIAPIKey      string // the active provider's API key
+	AIProvider string // "grok" | "openai" | "deepseek" | "anthropic"
+	AIModel    string // model name — defaults to provider's recommended model
+	AIBaseURL  string // derived from AIProvider
+	AIAPIKey   string // the active provider's API key
 
 	// Individual API keys (only the active provider's key is required)
 	XAIAPIKey       string // Grok (xAI)
@@ -96,6 +96,9 @@ type Config struct {
 	// Monitor intervals
 	MonitorPriceSec int // price + hard rules check interval (default 10s)
 	MonitorAISec    int // Grok position analysis interval (default 1200s = 20min)
+
+	// Feature toggles
+	EnableAI bool // enable/disable AI scoring (default: true)
 }
 
 var PreFilterEnabled bool = true
@@ -138,17 +141,17 @@ func Load() (*Config, error) {
 	}
 
 	// ── Pre‑filter toggle ──────────────────────────────────────────────────
-preFilterStr := os.Getenv("ENABLE_PREFILTER")
-if preFilterStr == "" {
-    PreFilterEnabled = true // default menyala
-} else {
-    enabled, err := strconv.ParseBool(preFilterStr)
-    if err != nil {
-        PreFilterEnabled = true
-    } else {
-        PreFilterEnabled = enabled
-    }
-}
+	preFilterStr := os.Getenv("ENABLE_PREFILTER")
+	if preFilterStr == "" {
+		PreFilterEnabled = true // default menyala
+	} else {
+		enabled, err := strconv.ParseBool(preFilterStr)
+		if err != nil {
+			PreFilterEnabled = true
+		} else {
+			PreFilterEnabled = enabled
+		}
+	}
 
 	// ── AI Provider ───────────────────────────────────────────────────────────
 
@@ -164,6 +167,11 @@ if preFilterStr == "" {
 	}
 	cfg.AIBaseURL = baseURL
 
+	// allow override via AI_BASE_URL env (useful for custom proxies / agent routers)
+	if override := os.Getenv("AI_BASE_URL"); override != "" {
+		cfg.AIBaseURL = override
+	}
+
 	// model — use custom if set, otherwise use provider default
 	cfg.AIModel = os.Getenv("AI_MODEL")
 	if cfg.AIModel == "" {
@@ -171,9 +179,9 @@ if preFilterStr == "" {
 	}
 
 	// load all provider keys (only the active one is strictly required)
-	cfg.XAIAPIKey       = os.Getenv("XAI_API_KEY")
-	cfg.OpenAIAPIKey    = os.Getenv("OPENAI_API_KEY")
-	cfg.DeepSeekAPIKey  = os.Getenv("DEEPSEEK_API_KEY")
+	cfg.XAIAPIKey = os.Getenv("XAI_API_KEY")
+	cfg.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
+	cfg.DeepSeekAPIKey = os.Getenv("DEEPSEEK_API_KEY")
 	cfg.AnthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")
 
 	// set the active API key based on selected provider
@@ -196,8 +204,8 @@ if preFilterStr == "" {
 
 	cfg.DiscordBotToken = os.Getenv("DISCORD_BOT_TOKEN")
 	if cfg.DiscordBotToken == "" {
-    fmt.Println("warn: DISCORD_BOT_TOKEN not set — Discord features disabled")
-}
+		fmt.Println("warn: DISCORD_BOT_TOKEN not set — Discord features disabled")
+	}
 
 	cfg.DiscordGuildID = os.Getenv("DISCORD_GUILD_ID")
 	if cfg.DiscordGuildID == "" {
@@ -212,6 +220,19 @@ if preFilterStr == "" {
 	cfg.DiscordAuthorizedRoleID = os.Getenv("DISCORD_AUTHORIZED_ROLE_ID")
 	if cfg.DiscordAuthorizedRoleID == "" {
 		fmt.Println("config: DISCORD_AUTHORIZED_ROLE_ID is required")
+	}
+
+	// ── AI toggle ────────────────────────────────────────────────────────────
+	enableAIStr := os.Getenv("ENABLE_AI")
+	if enableAIStr == "" {
+		cfg.EnableAI = true // default enabled
+	} else {
+		enabled, err := strconv.ParseBool(enableAIStr)
+		if err != nil {
+			cfg.EnableAI = true
+		} else {
+			cfg.EnableAI = enabled
+		}
 	}
 
 	// ── Monitor intervals ─────────────────────────────────────────────────────

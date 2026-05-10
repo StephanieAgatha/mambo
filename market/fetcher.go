@@ -33,7 +33,7 @@ type OHLCV struct {
 // Sent to Grok alongside TA values to improve AI decision quality.
 type MarketContext struct {
 	FearGreedValue int
-	FearGreedZone  string  // "Extreme Fear" / "Fear" / "Neutral" / "Greed" / "Extreme Greed"
+	FearGreedZone  string // "Extreme Fear" / "Fear" / "Neutral" / "Greed" / "Extreme Greed"
 	FundingRate    float64
 	FundingBias    string  // "positive (longs pay)" / "negative (shorts pay)" / "neutral"
 	OIChange       string  // "rising" / "falling" / "flat"
@@ -325,9 +325,9 @@ func (f *Fetcher) FetchLongShortRatio(ctx context.Context, pair string) (float64
 // Non-fatal: if any individual source fails, it logs a warning and continues with defaults.
 func (f *Fetcher) FetchMarketContext(ctx context.Context, pair string) (MarketContext, error) {
 	mc := MarketContext{
-		FundingBias:   "neutral",
-		OIChange:      "flat",
-		LongShortBias: "balanced",
+		FundingBias:    "neutral",
+		OIChange:       "flat",
+		LongShortBias:  "balanced",
 		LongShortRatio: 1.0,
 	}
 
