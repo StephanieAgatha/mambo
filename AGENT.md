@@ -16,8 +16,8 @@ All notifications and controls go through Discord.
 - Trend is your friend — always trade in direction of 4H/Daily trend
 - Confluence is everything — minimum 3 signals must align
 - Support/Resistance are your entry/exit anchors — never ignore key levels
-- Risk management first — R:R must be ≥ 3.0, no exceptions
-- Minimum confidence: 85% — below this, always ABORT
+- Risk management first — R:R must be ≥ 2.0, no exceptions
+- Minimum confidence: 55% — below this, always ABORT
 
 ---
 
@@ -35,8 +35,8 @@ All rules are % of live Hyperliquid balance, fetched before every scan.
 | Daily loss limit | 15% | $3.00 → stop |
 | Daily win limit | 30% | $6.00 → lock |
 | Max consecutive losses | 2 | → 24h break |
-| Min R:R | 3.0 | non-negotiable |
-| Min confidence | 85% | non-negotiable |
+| Min R:R | 2.0 | non-negotiable |
+| Min confidence | 55% | non-negotiable |
 
 No hard limit on position count. Open as many as 60% budget allows.
 Never open if remaining budget < 5% of balance.
@@ -111,7 +111,7 @@ Never open if remaining budget < 5% of balance.
 4. Bullish candle at EMA/support (pinbar, engulfing, hammer)
 5. Volume above average
 - **SL**: ATR-based, just below support
-- **TP**: next resistance, R:R ≥ 3.0
+- **TP**: next resistance, R:R ≥ 2.0
 
 ### Strategy 2: MACD + RSI Divergence at Support
 1. Bullish divergence at key support level
@@ -144,8 +144,8 @@ Never open if remaining budget < 5% of balance.
 - Entry near strong resistance without breakout confirmation
 - Fear & Greed > 75 → no new buys
 - Fear & Greed < 25 → no shorts
-- R:R < 3.0 → always ABORT
-- Confidence < 85% → always ABORT
+- R:R < 2.0 → always ABORT
+- Confidence < 55% → always ABORT
 
 ---
 
@@ -217,7 +217,7 @@ Constraints:
 10. Check Support/Resistance levels → AtSupport? NearResistance?
 11. Check Fear & Greed + funding rate + L/S ratio
 12. Count confluence → pick strategy
-13. Verify R:R ≥ 3.0 + confidence ≥ 85%
+13. Verify R:R ≥ 2.0 + confidence ≥ 55%
 14. Decide size (5–20%, within budget) + leverage (1–10x)
 15. Place limit order at/near support, set ATR-based SL + S/R-aware TP
 

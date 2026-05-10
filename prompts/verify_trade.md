@@ -106,13 +106,13 @@ EMA_Spread = |EMA9 - EMA21| / Price × 100
 
 ## 5. Validation
 
-### R:R (minimum 3.0 — hard rejected below this)
+### R:R (minimum 2.0 — hard rejected below this)
 - SL  : ${{RECOMMENDED_SL}} (ATR-based)
 - TP  : ${{TAKE_PROFIT}}
 - R:R : {{RR_RATIO}} → {{RR_GATE}} (PASS / REJECT)
 
 ### Thresholds
-- Confidence minimum : 85% — below this → ABORT
+- Confidence minimum : 55% — below this → ABORT
 - Budget minimum     : ${{MIN_SIZE}} remaining required
 
 ---
@@ -188,7 +188,7 @@ Suggested leverage : {{SUGGESTED_LEVERAGE}}x cross
 Reasoning          : {{SIZING_REASONING}}
 
 > Go code clamps: size 5–20% of balance, leverage 1–10x cross.
-> R:R < 3.0 → auto-rejected. Confidence < 85% → auto-rejected.
+> R:R < 2.0 → auto-rejected. Confidence < 55% → auto-rejected.
 
 ---
 

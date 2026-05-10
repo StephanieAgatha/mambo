@@ -200,8 +200,8 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
    Output: EXECUTE/ABORT + size + leverage + strategy
 
 9. VALIDATE + CLAMP (Go code — AI cannot bypass)
-   confidence < 85% → reject
-   R:R < 3.0 → reject
+   confidence < 55% → reject
+   R:R < 2.0 → reject
    size: 5–20%, leverage: 1–10x
 
 10. ORDER EXECUTION
@@ -254,7 +254,7 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 Layer 1  Trend + S/R Gate (Go)         EMA spread < 0.2% → skip
 Layer 2  Pre-filter Rules (Go)          RSI, EMA, volume, budget
 Layer 3  News Sentiment Gate (AI)       SKIP on exploits, hacks, SEC; WARN on unlocks, whales
-Layer 4  AI Trade Scoring               confidence ≥ 85%, R:R ≥ 3.0, S/R aware
+Layer 4  AI Trade Scoring               confidence ≥ 55%, R:R ≥ 2.0, S/R aware
 Layer 5  Output Clamp (Go)             size 5–20%, leverage 1–10x
 Layer 6  Order Safety (Go)             limit only, 10min auto-cancel
 Layer 7  Position Hard Rules (Go)      drawdown, max hold, smart loss cut

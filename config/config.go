@@ -25,8 +25,8 @@ const (
 
 	// Trade rules
 	MaxConsecutiveLosses = 2   // consecutive losses → 24h mandatory break
-	MinConfidence        = 85  // AI confidence minimum to proceed
-	MinRiskReward        = 3.0 // R:R minimum — hard rejected below this
+	MinConfidence        = 55  // AI confidence minimum to proceed
+	MinRiskReward        = 2.0 // R:R minimum — hard rejected below this
 	OrderTimeoutMin      = 10  // minutes before unfilled limit order is cancelled
 
 	// EMA trend gate
