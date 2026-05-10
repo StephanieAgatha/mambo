@@ -88,46 +88,62 @@ func (b *Bot) handleStatus(s *discordgo.Session, i *discordgo.InteractionCreate)
 	})
 }
 
-// handleJournal shows today's trades or last 7 days based on the "range" option.
+// handleJournal shows today's fills or last 7 days fetched live from Hyperliquid.
+// Paginated: 10 trades per page.
 func (b *Bot) handleJournal(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
 	rangeVal := "today"
+	page := 1
 	for _, opt := range data.Options {
 		if opt.Name == "range" {
 			rangeVal = opt.StringValue()
 		}
+		if opt.Name == "page" {
+			page = int(opt.IntValue())
+		}
+	}
+	if page < 1 {
+		page = 1
 	}
 
-	var trades []journal.ClosedTrade
-	var err error
+	ctx := context.Background()
+	now := time.Now()
+	wib := time.FixedZone("WIB", 7*60*60)
+	var startTime int64
+	label := "Today"
 
 	if rangeVal == "week" {
-		trades, err = b.jl.GetWeekTrades()
+		startTime = now.AddDate(0, 0, -7).UnixMilli()
+		label = "7 Days"
 	} else {
-		trades, err = b.jl.GetTodayTrades()
+		nowWIB := now.In(wib)
+		todayStart := time.Date(nowWIB.Year(), nowWIB.Month(), nowWIB.Day(), 0, 0, 0, 0, wib)
+		startTime = todayStart.UnixMilli()
 	}
 
+	fills, err := b.exClient.FetchFilledTrades(ctx, startTime, nil)
 	if err != nil {
-		slog.Error("discord: fetch journal failed", "err", err)
+		slog.Error("discord: fetch fills failed", "err", err)
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
 				Embeds: []*discordgo.MessageEmbed{{
-					Title: "❌ Error", Description: "Failed to fetch journal.",
-					Color: ColorRed,
+					Title:       "❌ Error",
+					Description: "Failed to fetch trades from exchange.",
+					Color:       ColorRed,
 				}},
 			},
 		})
 		return
 	}
 
-	if len(trades) == 0 {
+	if len(fills) == 0 {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
 				Embeds: []*discordgo.MessageEmbed{{
-					Title:       fmt.Sprintf("📖 Journal (%s)", rangeVal),
-					Description: "No trades found.",
+					Title:       fmt.Sprintf("📖 Journal — %s", label),
+					Description: "No filled trades found.",
 					Color:       ColorBlue,
 				}},
 			},
@@ -135,38 +151,59 @@ func (b *Bot) handleJournal(s *discordgo.Session, i *discordgo.InteractionCreate
 		return
 	}
 
+	// filter out zero-PnL fills (partial fills / open entries)
+	filtered := make([]exchange.FilledTrade, 0, len(fills))
+	for _, f := range fills {
+		if f.ClosedPnL != 0 {
+			filtered = append(filtered, f)
+		}
+	}
+	fills = filtered
+
+	if len(fills) == 0 {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("📖 Journal — %s", label),
+					Description: "No closed trades yet (all $0.00 fills are partial entries).",
+					Color:       ColorBlue,
+				}},
+			},
+		})
+		return
+	}
+
+	// sort fills newest first
+	for i := 0; i < len(fills)/2; i++ {
+		j := len(fills) - 1 - i
+		fills[i], fills[j] = fills[j], fills[i]
+	}
+
+	// calc totals from ALL fills
 	totalPnL := 0.0
 	wins := 0
 	losses := 0
-
-	fields := make([]*discordgo.MessageEmbedField, 0, len(trades)+1)
-	for _, t := range trades {
-		totalPnL += t.PnLUSD
-		if t.Result == "WIN" {
+	for _, f := range fills {
+		totalPnL += f.ClosedPnL
+		if f.ClosedPnL > 0 {
 			wins++
-		} else {
+		} else if f.ClosedPnL < 0 {
 			losses++
 		}
-
-		emoji := "✅"
-		if t.Result == "LOSS" {
-			emoji = "🔴"
-		}
-
-		pnlLabel := fmt.Sprintf("$%.2f", t.PnLUSD)
-		if t.PnLUSD > 0 {
-			pnlLabel = "+" + pnlLabel
-		}
-
-		fields = append(fields, &discordgo.MessageEmbedField{
-			Name: fmt.Sprintf("%s %s — %s (%s)", emoji, t.Pair, t.Result, t.CloseReason),
-			Value: fmt.Sprintf(
-				"Entry: $%.4f | Exit: $%.4f | PnL: %s\nStrategy: %s",
-				t.EntryPrice, t.ExitPrice, pnlLabel, t.Strategy,
-			),
-			Inline: false,
-		})
 	}
+
+	const perPage = 10
+	totalPages := (len(fills) + perPage - 1) / perPage
+	if page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * perPage
+	end := start + perPage
+	if end > len(fills) {
+		end = len(fills)
+	}
+	pageFills := fills[start:end]
 
 	winRate := 0.0
 	if wins+losses > 0 {
@@ -178,15 +215,60 @@ func (b *Bot) handleJournal(s *discordgo.Session, i *discordgo.InteractionCreate
 		pnlLabel = "+" + pnlLabel
 	}
 
-	summary := fmt.Sprintf("Total PnL: %s | Wins: %d | Losses: %d | Win Rate: %.0f%%",
-		pnlLabel, wins, losses, winRate)
+	fields := make([]*discordgo.MessageEmbedField, 0, len(pageFills)+1)
+
+	// top summary
+	fields = append(fields, &discordgo.MessageEmbedField{
+		Name: "━━━━━━━━━━━━━━━━━━━━",
+		Value: fmt.Sprintf(
+			"**Total PnL:** %s | **W:** %d | **L:** %d | **WR:** %.0f%%",
+			pnlLabel, wins, losses, winRate,
+		),
+		Inline: false,
+	})
+
+	// per-fill detail
+	for _, f := range pageFills {
+		// side: "A" = open short/close long, "B" = open long/close short
+		sideEmoji := "🟢"
+		sideLabel := "LONG"
+		if f.Side == "A" {
+			sideEmoji = "🔴"
+			sideLabel = "SHORT"
+		}
+
+		pnlEmoji := "✅"
+		if f.ClosedPnL < 0 {
+			pnlEmoji = "❌"
+		}
+
+		pnlLabel := fmt.Sprintf("$%.2f", f.ClosedPnL)
+		if f.ClosedPnL > 0 {
+			pnlLabel = "+" + pnlLabel
+		}
+
+		timeWIB := f.Time.In(wib)
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name: fmt.Sprintf("%s %s %s  %s %s",
+				sideEmoji, f.Coin, sideLabel, pnlEmoji, pnlLabel),
+			Value: fmt.Sprintf(
+				"```Price: $%.4f   Size: %.4f %s   Fee: $%.3f\n%s WIB```",
+				f.Price, f.Size, f.Coin, f.Fee,
+				timeWIB.Format("02 Jan · 15:04"),
+			),
+			Inline: false,
+		})
+	}
+
+	footer := fmt.Sprintf("Page %d/%d  •  %d total fills  •  Live from Hyperliquid",
+		page, totalPages, len(fills))
 
 	embed := &discordgo.MessageEmbed{
-		Title:       fmt.Sprintf("📖 Journal — %s", rangeVal),
-		Description: summary,
-		Color:       ColorBlue,
-		Fields:      fields,
-		Timestamp:   time.Now().Format(time.RFC3339),
+		Title:     fmt.Sprintf("📖 Journal — %s", label),
+		Color:     ColorBlue,
+		Fields:    fields,
+		Footer:    &discordgo.MessageEmbedFooter{Text: footer},
+		Timestamp: now.Format(time.RFC3339),
 	}
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -197,16 +279,19 @@ func (b *Bot) handleJournal(s *discordgo.Session, i *discordgo.InteractionCreate
 	})
 }
 
-// handlePnl shows total PnL and win rate from journal.
+// handlePnl shows total PnL + per-coin breakdown from Hyperliquid fills (7 days).
 func (b *Bot) handlePnl(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	trades, err := b.jl.GetWeekTrades()
+	ctx := context.Background()
+	startTime := time.Now().AddDate(0, 0, -7).UnixMilli()
+
+	fills, err := b.exClient.FetchFilledTrades(ctx, startTime, nil)
 	if err != nil {
-		slog.Error("discord: fetch trades for PnL failed", "err", err)
+		slog.Error("discord: fetch fills for PnL failed", "err", err)
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
 				Embeds: []*discordgo.MessageEmbed{{
-					Title: "❌ Error", Description: "Failed to fetch PnL.",
+					Title: "❌ Error", Description: "Failed to fetch PnL from exchange.",
 					Color: ColorRed,
 				}},
 			},
@@ -214,12 +299,34 @@ func (b *Bot) handlePnl(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	if len(trades) == 0 {
+	if len(fills) == 0 {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
 				Embeds: []*discordgo.MessageEmbed{{
-					Title: "💰 PnL (7 days)", Description: "No trades yet.",
+					Title: "💰 PnL (7 days)", Description: "No filled trades found.",
+					Color: ColorBlue,
+				}},
+			},
+		})
+		return
+	}
+
+	// filter zero-PnL fills (partial fills / open entries)
+	filtered := make([]exchange.FilledTrade, 0, len(fills))
+	for _, f := range fills {
+		if f.ClosedPnL != 0 {
+			filtered = append(filtered, f)
+		}
+	}
+	fills = filtered
+
+	if len(fills) == 0 {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title: "💰 PnL (7 days)", Description: "No closed trades found.",
 					Color: ColorBlue,
 				}},
 			},
@@ -233,18 +340,40 @@ func (b *Bot) handlePnl(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	bestWin := 0.0
 	worstLoss := 0.0
 
-	for _, t := range trades {
-		totalPnL += t.PnLUSD
-		if t.Result == "WIN" {
+	// per-coin aggregation
+	type coinStats struct {
+		pnl    float64
+		wins   int
+		losses int
+	}
+	coinMap := make(map[string]*coinStats)
+	coinOrder := make([]string, 0) // insertion order
+
+	for _, f := range fills {
+		totalPnL += f.ClosedPnL
+		if f.ClosedPnL > 0 {
 			wins++
-			if t.PnLUSD > bestWin {
-				bestWin = t.PnLUSD
+			if f.ClosedPnL > bestWin {
+				bestWin = f.ClosedPnL
 			}
-		} else {
+		} else if f.ClosedPnL < 0 {
 			losses++
-			if t.PnLUSD < worstLoss {
-				worstLoss = t.PnLUSD
+			if f.ClosedPnL < worstLoss {
+				worstLoss = f.ClosedPnL
 			}
+		}
+
+		cs, ok := coinMap[f.Coin]
+		if !ok {
+			cs = &coinStats{}
+			coinMap[f.Coin] = cs
+			coinOrder = append(coinOrder, f.Coin)
+		}
+		cs.pnl += f.ClosedPnL
+		if f.ClosedPnL > 0 {
+			cs.wins++
+		} else if f.ClosedPnL < 0 {
+			cs.losses++
 		}
 	}
 
@@ -253,24 +382,46 @@ func (b *Bot) handlePnl(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		winRate = float64(wins) / float64(wins+losses) * 100
 	}
 
-	pnlLabel := fmt.Sprintf("$%.2f", totalPnL)
-	if totalPnL > 0 {
-		pnlLabel = "+" + pnlLabel
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Total PnL", Value: formatPnL(totalPnL), Inline: true},
+		{Name: "Win Rate", Value: fmt.Sprintf("%.0f%%", winRate), Inline: true},
+		{Name: "Trades", Value: fmt.Sprintf("%d", wins+losses), Inline: true},
+		{Name: "Wins", Value: fmt.Sprintf("%d", wins), Inline: true},
+		{Name: "Losses", Value: fmt.Sprintf("%d", losses), Inline: true},
+		{Name: "Best Win", Value: fmt.Sprintf("$%.2f", bestWin), Inline: true},
+		{Name: "Worst Loss", Value: fmt.Sprintf("$%.2f", worstLoss), Inline: true},
+	}
+
+	// per-coin breakdown
+	if len(coinOrder) > 0 {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:   "━━━━━━ Per Coin ━━━━━━",
+			Value:  "",
+			Inline: false,
+		})
+		for _, coin := range coinOrder {
+			cs := coinMap[coin]
+			wr := 0.0
+			if cs.wins+cs.losses > 0 {
+				wr = float64(cs.wins) / float64(cs.wins+cs.losses) * 100
+			}
+			fields = append(fields, &discordgo.MessageEmbedField{
+				Name: fmt.Sprintf("%s", coin),
+				Value: fmt.Sprintf(
+					"%s  |  W:%d L:%d  |  WR: %.0f%%",
+					formatPnL(cs.pnl), cs.wins, cs.losses, wr,
+				),
+				Inline: true,
+			})
+		}
 	}
 
 	embed := &discordgo.MessageEmbed{
-		Title: "💰 PnL Summary (7 days)",
-		Color: ColorBlue,
-		Fields: []*discordgo.MessageEmbedField{
-			{Name: "Total PnL", Value: pnlLabel, Inline: true},
-			{Name: "Win Rate", Value: fmt.Sprintf("%.0f%%", winRate), Inline: true},
-			{Name: "Total Trades", Value: fmt.Sprintf("%d", wins+losses), Inline: true},
-			{Name: "Wins", Value: fmt.Sprintf("%d", wins), Inline: true},
-			{Name: "Losses", Value: fmt.Sprintf("%d", losses), Inline: true},
-			{Name: "Best Win", Value: fmt.Sprintf("$%.2f", bestWin), Inline: true},
-			{Name: "Worst Loss", Value: fmt.Sprintf("$%.2f", worstLoss), Inline: true},
-		},
+		Title:     "💰 PnL Summary (7 days)",
+		Color:     ColorBlue,
+		Fields:    fields,
 		Timestamp: time.Now().Format(time.RFC3339),
+		Footer:    &discordgo.MessageEmbedFooter{Text: "Live data from Hyperliquid"},
 	}
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -279,6 +430,15 @@ func (b *Bot) handlePnl(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
+}
+
+// formatPnL returns a signed PnL string.
+func formatPnL(amount float64) string {
+	s := fmt.Sprintf("$%.2f", amount)
+	if amount > 0 {
+		s = "+" + s
+	}
+	return s
 }
 
 // handleMode toggles between auto and manual trading modes.
@@ -323,9 +483,9 @@ func (b *Bot) handleCapital(s *discordgo.Session, i *discordgo.InteractionCreate
 		return
 	}
 
-	lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
+	lossUSD, winUSD, consecLosses, err := b.exClient.FetchDailyPnL(context.Background())
 	if err != nil {
-		slog.Warn("discord: get daily PnL failed", "err", err)
+		slog.Warn("discord: fetch daily PnL failed", "err", err)
 	}
 
 	positions, err := b.exClient.FetchPositions(context.Background())
@@ -410,7 +570,7 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 				return
 			}
 
-			lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
+			lossUSD, winUSD, consecLosses, err := b.exClient.FetchDailyPnL(ctx)
 			if err != nil {
 				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 					Embeds: &[]*discordgo.MessageEmbed{{
@@ -648,7 +808,7 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			slog.Warn("discord: /execute fetch balance failed", "err", err)
 		}
 
-		lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
+		lossUSD, winUSD, consecLosses, err := b.exClient.FetchDailyPnL(ctx)
 		if err != nil {
 			slog.Warn("discord: /execute daily PnL failed", "err", err)
 		}

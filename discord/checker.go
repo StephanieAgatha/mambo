@@ -61,7 +61,7 @@ func (b *Bot) handleCheck(s *discordgo.Session, i *discordgo.InteractionCreate) 
 		slog.Warn("discord: /check fetch balance failed", "err", err)
 	}
 
-	lossUSD, winUSD, consecLosses, err := b.jl.GetDailyPnL()
+	lossUSD, winUSD, consecLosses, err := b.exClient.FetchDailyPnL(ctx)
 	if err != nil {
 		slog.Warn("discord: /check daily PnL failed", "err", err)
 	}

@@ -316,6 +316,107 @@ func (c *Client) CancelOrder(ctx context.Context, pair string, orderID uint64) e
 	return nil
 }
 
+// FilledTrade represents a completed fill from Hyperliquid's userFills endpoint.
+type FilledTrade struct {
+	Coin      string
+	Side      string // "A" = sell/short, "B" = buy/long
+	Price     float64
+	Size      float64
+	ClosedPnL float64
+	Fee       float64
+	Time      time.Time
+	Oid       int64
+	Tid       int64
+	Dir       string // direction of the trade
+	Hash      string
+}
+
+// FetchFilledTrades fetches all filled trades for the account within a time range.
+// startTime/endTime are unix timestamps in milliseconds.
+func (c *Client) FetchFilledTrades(ctx context.Context, startTime int64, endTime *int64) ([]FilledTrade, error) {
+	fills, err := c.info.UserFillsByTime(ctx, c.cfg.AccountAddress, startTime, endTime, nil)
+	if err != nil {
+		return nil, fmt.Errorf("exchange: fetch filled trades failed account=%s: %w", c.cfg.AccountAddress, err)
+	}
+
+	trades := make([]FilledTrade, 0, len(fills))
+	for _, f := range fills {
+		price, err := strconv.ParseFloat(f.Price, 64)
+		if err != nil {
+			slog.Warn("exchange: parse fill price failed", "px", f.Price, "coin", f.Coin, "err", err)
+			continue
+		}
+		size, err := strconv.ParseFloat(f.Size, 64)
+		if err != nil {
+			slog.Warn("exchange: parse fill size failed", "sz", f.Size, "coin", f.Coin, "err", err)
+			continue
+		}
+		pnl, err := strconv.ParseFloat(f.ClosedPnl, 64)
+		if err != nil {
+			slog.Warn("exchange: parse fill pnl failed", "pnl", f.ClosedPnl, "coin", f.Coin, "err", err)
+			continue
+		}
+		fee, err := strconv.ParseFloat(f.Fee, 64)
+		if err != nil {
+			fee = 0
+		}
+
+		trades = append(trades, FilledTrade{
+			Coin:      f.Coin,
+			Side:      f.Side,
+			Price:     price,
+			Size:      size,
+			ClosedPnL: pnl,
+			Fee:       fee,
+			Time:      time.UnixMilli(f.Time),
+			Oid:       f.Oid,
+			Tid:       f.Tid,
+			Dir:       f.Dir,
+			Hash:      f.Hash,
+		})
+	}
+
+	slog.Info("filled trades fetched",
+		"account", c.cfg.AccountAddress,
+		"count", len(trades),
+		"network", c.cfg.NetworkLabel(),
+	)
+
+	return trades, nil
+}
+
+// FetchDailyPnL returns today's loss, win, and consecutive loss count from live fills.
+func (c *Client) FetchDailyPnL(ctx context.Context) (lossUSD float64, winUSD float64, consecLosses int, err error) {
+	wib := time.FixedZone("WIB", 7*60*60)
+	nowWIB := time.Now().In(wib)
+	todayStart := time.Date(nowWIB.Year(), nowWIB.Month(), nowWIB.Day(), 0, 0, 0, 0, wib)
+	startTime := todayStart.UnixMilli()
+
+	fills, err := c.FetchFilledTrades(ctx, startTime, nil)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("exchange: fetch daily PnL: %w", err)
+	}
+
+	// calculate consecutive losses from the end
+	for i := len(fills) - 1; i >= 0; i-- {
+		if fills[i].ClosedPnL < 0 {
+			consecLosses++
+		} else {
+			break
+		}
+	}
+
+	for _, f := range fills {
+		if f.ClosedPnL < 0 {
+			lossUSD += -f.ClosedPnL
+		} else {
+			winUSD += f.ClosedPnL
+		}
+	}
+
+	return lossUSD, winUSD, consecLosses, nil
+}
+
 // ClosePosition closes an open position using a reduce-only market order.
 func (c *Client) ClosePosition(ctx context.Context, pair string, side OrderSide) error {
 	isBuy := side == OrderSideShort

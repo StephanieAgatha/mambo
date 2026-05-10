@@ -129,7 +129,7 @@ func (b *Bot) registerCommands() error {
 		},
 		{
 			Name:        "journal",
-			Description: "Show trade history",
+			Description: "Show trade history from exchange",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Name:        "range",
@@ -140,6 +140,12 @@ func (b *Bot) registerCommands() error {
 						{Name: "today", Value: "today"},
 						{Name: "week", Value: "week"},
 					},
+				},
+				{
+					Name:        "page",
+					Description: "Page number (10 trades per page, default: 1)",
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Required:    false,
 				},
 			},
 		},
