@@ -2,6 +2,9 @@
 
 > Autonomous AI-powered futures trading bot for Hyperliquid.  
 > Built with Go. Disciplined. Emotionless. Balance-aware. Multi-provider AI.
+<img width="558" height="540" alt="mamboooo" src="https://github.com/user-attachments/assets/f3f3f9c9-00d9-49a4-bb7f-d5e61782696c" />
+
+
 
 ---
 
