@@ -915,7 +915,7 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 			},
 		})
 
-		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state)
+		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state, sr.skipReason)
 		b.scanMu.Lock()
 		b.activeScan = nil
 		b.scanMu.Unlock()
@@ -951,7 +951,7 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 			},
 		})
 
-		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state)
+		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state, fmt.Sprintf("AI scored: %s (confidence %.0f%%)", sr.score.Action, sr.score.Confidence))
 		b.scanMu.Lock()
 		b.activeScan = nil
 		b.scanMu.Unlock()
@@ -1116,7 +1116,21 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 		side = exchange.OrderSideShort
 	}
 
-	orderResult, err := b.exClient.PlaceLimitOrder(ctx, sr.pair, side, sr.score.PositionSizeUSD, sr.taResult.CurrentPrice, sr.score.Leverage)
+	// Clamp suggestion values — AI may return 0 for leverage
+	leverage := sr.score.Leverage
+	if leverage < config.MinLeverageX {
+		leverage = config.MinLeverageX
+	}
+	if leverage > config.MaxLeverageX {
+		leverage = config.MaxLeverageX
+	}
+	sizeUSD := sr.score.PositionSizeUSD
+	if sizeUSD <= 0 {
+		// AI didn't suggest size — use 5% of balance as default
+		sizeUSD = sr.state.Balance * 0.05
+	}
+
+	orderResult, err := b.exClient.PlaceLimitOrder(ctx, sr.pair, side, sizeUSD, sr.taResult.CurrentPrice, leverage)
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
@@ -1133,10 +1147,10 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 	}
 
 	// Place TP and SL trigger orders
-	coinSize := sr.score.PositionSizeUSD / sr.taResult.CurrentPrice
+	coinSize := sizeUSD / sr.taResult.CurrentPrice
 	b.placeTriggerOrders(ctx, sr.pair, side, coinSize, sr.score.StopLoss, sr.score.TakeProfit)
 
-	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sr.score.PositionSizeUSD, sr.score.Leverage,
+	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sizeUSD, leverage,
 		sr.score.StopLoss, sr.score.TakeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
 
 	// Notify channel
@@ -1148,8 +1162,8 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 			{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
 			{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
 			{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
-			{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
-			{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+			{Name: "Size", Value: fmt.Sprintf("$%.2f", sizeUSD), Inline: true},
+			{Name: "Leverage", Value: fmt.Sprintf("%dx", leverage), Inline: true},
 			{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
 			{Name: "Strategy", Value: sr.score.Strategy, Inline: true},
 			{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
@@ -1171,8 +1185,8 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 					{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
 					{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
 					{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
-					{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
-					{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+					{Name: "Size", Value: fmt.Sprintf("$%.2f", sizeUSD), Inline: true},
+					{Name: "Leverage", Value: fmt.Sprintf("%dx", leverage), Inline: true},
 					{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
 				},
 				Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
@@ -1252,6 +1266,7 @@ func (b *Bot) showSkippedPair(s *discordgo.Session, i *discordgo.InteractionCrea
 		{Name: "RSI", Value: fmt.Sprintf("%.2f", taResult.RSI), Inline: true},
 		{Name: "EMA200", Value: fmt.Sprintf("$%.4f", taResult.EMA200), Inline: true},
 		{Name: "Volume", Value: fmt.Sprintf("%.2fx", taResult.VolumeMultiplier), Inline: true},
+		{Name: "Reason", Value: reason, Inline: false},
 	}
 
 	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{

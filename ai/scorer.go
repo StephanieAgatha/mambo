@@ -123,14 +123,18 @@ func (s *Scorer) Score(
 
 // Suggest runs the advisory-only prompt — no clamping, no guardrails.
 // Returns the AI's raw trade suggestion for user review (DYOR).
+// prefilterReason is the prefilter rejection reason (empty if not prefilter-skipped).
 func (s *Scorer) Suggest(
 	ctx context.Context,
 	pair string,
 	taResult ta.TAResult,
 	mc market.MarketContext,
 	state filter.BotState,
+	prefilterReason string,
 ) (ScoreResult, error) {
 	prompt := s.fillTemplate(pair, taResult, mc, state)
+	// Inject the prefilter reason into the template
+	prompt = strings.ReplaceAll(prompt, "{{PREFILTER_REASON}}", prefilterReason)
 
 	slog.Debug("sending suggestion request to AI",
 		"provider", s.cfg.AIProvider,
