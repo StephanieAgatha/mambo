@@ -19,13 +19,17 @@ import (
 	aiPkg "mambo/ai"
 )
 
-// scanResult holds a scored pair waiting for user accept/decline.
+// scanResult holds a scored pair waiting for user accept/decline/suggest.
 type scanResult struct {
 	pair     string
 	taResult ta.TAResult
 	mc       market.MarketContext
 	state    filter.BotState
 	score    aiPkg.ScoreResult
+	// suggestMode is true when this is a prefilter-skipped pair that needs AI opinion
+	suggestMode bool
+	// skipReason is the prefilter rejection reason (only set in suggestMode)
+	skipReason string
 }
 
 // handleStatus shows all open positions with live PnL.
@@ -643,7 +647,9 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 						})
 						return
 					}
-					continue
+					// Offer Suggest on prefilter skip — let AI give advisory opinion
+					b.showSkippedPair(s, i, pair, taResult, mc, state, filterResult.Reason)
+					return
 				}
 
 				if !b.cfg.EnableAI {
@@ -826,7 +832,7 @@ func (b *Bot) showScanResult(s *discordgo.Session, i *discordgo.InteractionCreat
 	acceptLabel := "✅ Accept"
 	declineLabel := "❌ Decline"
 	if !isTrade {
-		acceptLabel = "✅ Acknowledge"
+		acceptLabel = "💡 Suggest"
 		declineLabel = "❌ Skip"
 	}
 
@@ -894,30 +900,56 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 	ctx := context.Background()
 	isTrade := sr.score.Action == "open_long" || sr.score.Action == "open_short"
 
-	if !isTrade {
-		// hold or wait — user acknowledged, clear state
+	if sr.suggestMode {
+		// Prefilter skipped pair — run AI Suggest for advisory opinion
+		// Update the deferred message to "thinking..."
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredMessageUpdate,
+		})
+
+		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state)
 		b.scanMu.Lock()
 		b.activeScan = nil
 		b.scanMu.Unlock()
 
-		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseUpdateMessage,
-			Data: &discordgo.InteractionResponseData{
-				Embeds: []*discordgo.MessageEmbed{{
-					Title:       fmt.Sprintf("⏸️ Acknowledged — %s (%s)", sr.pair, strings.ToUpper(sr.score.Action)),
-					Description: fmt.Sprintf("Strategy: **%s** | Confidence: **%.0f%%**\n%s",
-						sr.score.Strategy, sr.score.Confidence, sr.score.Reasoning),
-					Color:       ColorBlue,
-					Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
-					Timestamp:   time.Now().Format(time.RFC3339),
+		if err != nil {
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ AI Suggestion Failed — %s", sr.pair),
+					Description: err.Error(),
+					Color:       ColorRed,
 				}},
-				Components: []discordgo.MessageComponent{}, // remove buttons
-			},
+			})
+			return
+		}
+
+		b.showSuggestionResult(s, i, sr.pair, sr.taResult, sugg, sr.skipReason)
+		return
+	}
+
+	if !isTrade {
+		// AI already scored this as hold/wait — run AI Suggest for advisory opinion
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredMessageUpdate,
 		})
-		slog.Info("scan: user acknowledged hold/wait",
-			"pair", sr.pair,
-			"action", sr.score.Action,
-		)
+
+		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state)
+		b.scanMu.Lock()
+		b.activeScan = nil
+		b.scanMu.Unlock()
+
+		if err != nil {
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ AI Suggestion Failed — %s", sr.pair),
+					Description: err.Error(),
+					Color:       ColorRed,
+				}},
+			})
+			return
+		}
+
+		b.showSuggestionResult(s, i, sr.pair, sr.taResult, sugg, fmt.Sprintf("AI scored: %s (confidence %.0f%%)", sr.score.Action, sr.score.Confidence))
 		return
 	}
 
@@ -1052,6 +1084,116 @@ func (b *Bot) respondAck(s *discordgo.Session, i *discordgo.InteractionCreate, m
 			Content: msg,
 			Flags:   discordgo.MessageFlagsEphemeral,
 		},
+	})
+}
+
+// showSkippedPair displays a prefilter-skipped pair with Suggest/Skip buttons.
+func (b *Bot) showSkippedPair(s *discordgo.Session, i *discordgo.InteractionCreate, pair string, taResult ta.TAResult, mc market.MarketContext, state filter.BotState, reason string) {
+	channelID := i.ChannelID
+
+	// Store active scan so Suggest button handler can call AI
+	b.scanMu.Lock()
+	b.activeScan = &scanResult{
+		pair:        pair,
+		taResult:    taResult,
+		mc:          mc,
+		state:       state,
+		score:       aiPkg.ScoreResult{Action: "hold", Reasoning: reason},
+		suggestMode: true,
+		skipReason:  reason,
+	}
+	b.scanChannelID = channelID
+	b.scanMu.Unlock()
+
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Price", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+		{Name: "RSI", Value: fmt.Sprintf("%.2f", taResult.RSI), Inline: true},
+		{Name: "EMA200", Value: fmt.Sprintf("$%.4f", taResult.EMA200), Inline: true},
+		{Name: "Volume", Value: fmt.Sprintf("%.2fx", taResult.VolumeMultiplier), Inline: true},
+	}
+
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds: &[]*discordgo.MessageEmbed{{
+			Title:       "🔍 Scan Ready",
+			Description: fmt.Sprintf("Found **%s** but prefilter skipped it. Want AI suggestion?", pair),
+			Color:       ColorBlue,
+		}},
+	})
+
+	_, err := s.FollowupMessageCreate(i.Interaction, false, &discordgo.WebhookParams{
+		Embeds: []*discordgo.MessageEmbed{{
+			Title:       fmt.Sprintf("⏭️ %s — Skipped by Prefilter", pair),
+			Description: fmt.Sprintf("**Reason**: %s\n\nWant AI to analyze this pair anyway and give a trade suggestion?", reason),
+			Color:       ColorYellow,
+			Fields:      fields,
+			Footer:      &discordgo.MessageEmbedFooter{Text: "AI Suggestion is advisory only — DYOR"},
+			Timestamp:   time.Now().Format(time.RFC3339),
+		}},
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    "💡 Suggest",
+						Style:    discordgo.PrimaryButton,
+						CustomID: "scan_accept",
+					},
+					discordgo.Button{
+						Label:    "❌ Skip",
+						Style:    discordgo.DangerButton,
+						CustomID: "scan_decline",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		slog.Error("discord: scan follow-up with buttons failed", "pair", pair, "err", err)
+	}
+}
+
+// showSuggestionResult displays the AI advisory suggestion as a read-only embed.
+func (b *Bot) showSuggestionResult(s *discordgo.Session, i *discordgo.InteractionCreate, pair string, taResult ta.TAResult, sugg aiPkg.ScoreResult, contextReason string) {
+	isTrade := sugg.Action == "open_long" || sugg.Action == "open_short"
+	color := ColorYellow
+	title := fmt.Sprintf("💡 AI Suggestion — %s", pair)
+	if isTrade {
+		color = ColorGreen
+		title = fmt.Sprintf("💡 AI Suggestion — %s %s", pair, strings.ToUpper(strings.TrimPrefix(sugg.Action, "open_")))
+	}
+
+	desc := fmt.Sprintf("**%s**\n\nConfidence: **%.0f%%** | Strategy: **%s**",
+		sugg.Reasoning,
+		sugg.Confidence,
+		sugg.Strategy,
+	)
+
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Price", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+		{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sugg.Confidence), Inline: true},
+		{Name: "Strategy", Value: sugg.Strategy, Inline: true},
+		{Name: "Context", Value: contextReason, Inline: false},
+	}
+
+	if isTrade && sugg.PositionSizeUSD > 0 {
+		fields = append(fields,
+			&discordgo.MessageEmbedField{Name: "Entry", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+			&discordgo.MessageEmbedField{Name: "SL", Value: fmt.Sprintf("$%.4f", sugg.StopLoss), Inline: true},
+			&discordgo.MessageEmbedField{Name: "TP", Value: fmt.Sprintf("$%.4f", sugg.TakeProfit), Inline: true},
+			&discordgo.MessageEmbedField{Name: "Size", Value: fmt.Sprintf("$%.2f", sugg.PositionSizeUSD), Inline: true},
+			&discordgo.MessageEmbedField{Name: "Leverage", Value: fmt.Sprintf("%dx", sugg.Leverage), Inline: true},
+			&discordgo.MessageEmbedField{Name: "R:R", Value: fmt.Sprintf("%.2f", sugg.RRRatio), Inline: true},
+		)
+	}
+
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds: &[]*discordgo.MessageEmbed{{
+			Title:       title,
+			Description: desc,
+			Color:       color,
+			Fields:      fields,
+			Footer:      &discordgo.MessageEmbedFooter{Text: "This is an AI suggestion — use /execute to act on it. Always DYOR."},
+			Timestamp:   time.Now().Format(time.RFC3339),
+		}},
 	})
 }
 

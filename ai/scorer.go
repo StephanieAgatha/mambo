@@ -34,10 +34,11 @@ type ScoreResult struct {
 
 // Scorer sends trade setups to the configured AI provider and parses the response.
 type Scorer struct {
-	agentPrompt string
-	template    string
-	client      *Client
-	cfg         *config.Config
+	agentPrompt  string
+	template     string
+	suggestPrompt string
+	client       *Client
+	cfg          *config.Config
 }
 
 // NewScorer loads AGENT.md and verify_trade.md once at startup.
@@ -52,6 +53,11 @@ func NewScorer(cfg *config.Config) (*Scorer, error) {
 		return nil, fmt.Errorf("scorer: read prompts/verify_trade.md: %w", err)
 	}
 
+	suggestPrompt, err := os.ReadFile("prompts/suggest_trade.md")
+	if err != nil {
+		return nil, fmt.Errorf("scorer: read prompts/suggest_trade.md: %w", err)
+	}
+
 	// reasoning models can take longer — generous timeout
 	client := NewClient(cfg, 120*time.Second)
 
@@ -63,10 +69,11 @@ func NewScorer(cfg *config.Config) (*Scorer, error) {
 	)
 
 	return &Scorer{
-		agentPrompt: string(agentPrompt),
-		template:    string(template),
-		client:      client,
-		cfg:         cfg,
+		agentPrompt:   string(agentPrompt),
+		template:      string(template),
+		suggestPrompt: string(suggestPrompt),
+		client:        client,
+		cfg:           cfg,
 	}, nil
 }
 
@@ -112,6 +119,105 @@ func (s *Scorer) Score(
 	)
 
 	return result, nil
+}
+
+// Suggest runs the advisory-only prompt — no clamping, no guardrails.
+// Returns the AI's raw trade suggestion for user review (DYOR).
+func (s *Scorer) Suggest(
+	ctx context.Context,
+	pair string,
+	taResult ta.TAResult,
+	mc market.MarketContext,
+	state filter.BotState,
+) (ScoreResult, error) {
+	prompt := s.fillTemplate(pair, taResult, mc, state)
+
+	slog.Debug("sending suggestion request to AI",
+		"provider", s.cfg.AIProvider,
+		"model", s.cfg.AIModel,
+		"pair", pair,
+	)
+
+	raw, err := s.client.Chat(ctx, s.suggestPrompt, prompt)
+	if err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: AI suggest call failed pair=%s: %w", pair, err)
+	}
+
+	result, err := parseSuggestion(raw, pair)
+	if err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: parse suggestion failed pair=%s: %w", pair, err)
+	}
+
+	slog.Info("AI suggestion complete",
+		"provider", s.cfg.AIProvider,
+		"pair", pair,
+		"direction", result.Action,
+		"confidence", result.Confidence,
+		"size_usd", result.PositionSizeUSD,
+		"leverage", result.Leverage,
+		"rr_ratio", result.RRRatio,
+		"strategy", result.Strategy,
+	)
+
+	return result, nil
+}
+
+// parseSuggestion extracts the <suggestion> JSON block from AI response.
+func parseSuggestion(raw, pair string) (ScoreResult, error) {
+	re := regexp.MustCompile(`(?s)<suggestion>(.*?)</suggestion>`)
+	matches := re.FindStringSubmatch(raw)
+	if len(matches) < 2 {
+		slog.Warn("scorer: no <suggestion> block found — returning empty", "pair", pair)
+		return ScoreResult{
+			Symbol:    pair,
+			Action:    "hold",
+			Reasoning: "no suggestion block in AI response",
+		}, nil
+	}
+
+	jsonStr := strings.TrimSpace(matches[1])
+
+	var d struct {
+		Symbol          string  `json:"symbol"`
+		Direction       string  `json:"direction"`
+		SizeUSD         float64 `json:"size_usd"`
+		EntryPrice      float64 `json:"entry_price"`
+		StopLoss        float64 `json:"stop_loss"`
+		TakeProfit      float64 `json:"take_profit"`
+		Leverage        int     `json:"leverage"`
+		Confidence      float64 `json:"confidence"`
+		Strategy        string  `json:"strategy"`
+		ConfluenceCount int     `json:"confluence_count"`
+		RRRatio         float64 `json:"rr_ratio"`
+		Reasoning       string  `json:"reasoning"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &d); err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: unmarshal suggestion JSON: %w", err)
+	}
+
+	// Map the suggestion fields to ScoreResult
+	action := "hold"
+	switch strings.ToUpper(d.Direction) {
+	case "LONG":
+		action = "open_long"
+	case "SHORT":
+		action = "open_short"
+	}
+
+	return ScoreResult{
+		Symbol:          pair,
+		Action:          action,
+		Leverage:        d.Leverage,
+		PositionSizeUSD: d.SizeUSD,
+		StopLoss:        d.StopLoss,
+		TakeProfit:      d.TakeProfit,
+		Confidence:      d.Confidence,
+		Strategy:        d.Strategy,
+		ConfluenceCount: d.ConfluenceCount,
+		RRRatio:         d.RRRatio,
+		Reasoning:       d.Reasoning,
+	}, nil
 }
 
 // parseDecision extracts the <decision> JSON block from AI response.
