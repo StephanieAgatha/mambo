@@ -143,6 +143,13 @@ func (s *Scorer) Suggest(
 		return ScoreResult{}, fmt.Errorf("scorer: AI suggest call failed pair=%s: %w", pair, err)
 	}
 
+	// Log raw response at INFO so we can debug format issues
+	slog.Info("scorer: AI suggest raw response",
+		"pair", pair,
+		"raw_len", len(raw),
+		"raw_preview", raw[:min(len(raw), 500)],
+	)
+
 	result, err := parseSuggestion(raw, pair)
 	if err != nil {
 		return ScoreResult{}, fmt.Errorf("scorer: parse suggestion failed pair=%s: %w", pair, err)
