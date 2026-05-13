@@ -23,7 +23,8 @@ mambo/
 ├── CLAUDE.md                   # Coding rules (auto-read by Claude CLI)
 ├── news_research_agent.md      # News sentiment scan agent prompt + JSON spec
 ├── prompts/
-│   └── verify_trade.md         # Per-trade AI verification template
+│   ├── verify_trade.md         # Per-trade AI verification template
+│   └── suggest_trade.md        # AI advisory suggestion template (DYOR mode)
 ├── .env                        # All secrets + feature flags
 ├── .env.example                # Template
 ├── config/
@@ -109,7 +110,7 @@ To switch provider: change `AI_PROVIDER` and set the matching API key. No code c
 
 ## 📰 News Research Agent
 
-Before AI trade scoring, Mambo runs a **deep news sentiment scan** on the selected pair. The `news_research_agent.md` prompt instructs the AI to:
+Before AI trade scoring, Mambo runs a **deep news sentiment scan** on the selected pair (if enabled). The `news_research_agent.md` prompt instructs the AI to:
 
 - Scan **CryptoPanic, CoinDesk, The Block, Decrypt, CoinTelegraph** + financial/community sources
 - Assign a weighted sentiment score (-1.0 to +1.0)
@@ -188,30 +189,34 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
    ❌ Daily loss ≥ 15%         → skip all
    ❌ Capital at risk ≥ 60%    → skip all
 
-6. NEWS RESEARCH (AI-powered deep scan)
-   CryptoPanic, CoinDesk, The Block, Decrypt, CoinTelegraph, social
-   → PASS / WARN / SKIP gate decision
-
-7. ENRICH CONTEXT (free APIs)
+6. ENRICH CONTEXT (free APIs)
    Fear & Greed, Funding rate, OI, Long/Short ratio
 
-8. AI SCORING (configured provider)
-   Input: all TA + S/R + news gate + market context + portfolio state
-   Output: EXECUTE/ABORT + size + leverage + strategy
+7. AI SCORING (configured provider)
+   Input: all TA + S/R + market context + portfolio state
+   Output: open_long / open_short / hold / wait + size + leverage + strategy
 
-9. VALIDATE + CLAMP (Go code — AI cannot bypass)
-   confidence < 55% → reject
-   R:R < 2.0 → reject
+8. VALIDATE + CLAMP (Go code — AI cannot bypass)
+   confidence < 55% → force wait
+   R:R < 2.0 → force wait
    size: 5–20%, leverage: 1–10x
 
+9. CONFIRMATION (Discord buttons)
+   /scan → shows "🔍 Scanning best pair…" during search
+   Trade found → Accept/Decline buttons with entry, SL, TP, confidence
+   Skipped pair → Suggest/Skip buttons (AI advisory opinion)
+   Hold/wait  → Suggest/Skip buttons (AI analyses and gives trade idea)
+
 10. ORDER EXECUTION
-   Limit order, cross margin, 10min auto-cancel
+   Limit order, cross margin
    Auto-saves position → spawns monitor goroutine
 
-11. MONITOR (two tickers, starts automatically)
-    priceTicker (MonitorPriceSec) → TP/SL/hard rules
-    aiTicker    (MonitorAISec)    → AI position analysis
-    Auto-closes position → Discord notification → logged to journal.json
+11. MONITOR (two tickers, starts after position fills)
+   WaitForFill → confirm position exists on exchange
+   Place TP/SL trigger orders (reduce-only, visible on Hyperliquid UI)
+   priceTicker (MonitorPriceSec) → TP/SL/hard rules
+   aiTicker    (MonitorAISec)    → AI position analysis
+   Auto-closes position → Discord notification → logged to journal.json
 ```
 
 ---
@@ -219,6 +224,11 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 ## 👁️ Position Monitor
 
 ```
+waitForFill (up to 120min, polls every 15s):
+  Confirms position exists on exchange before monitoring begins
+  Places TP/SL trigger orders (reduce-only, visible on Hyperliquid UI)
+  On timeout: cleans up position record (no trade logged)
+
 priceTicker (fast — default 10s):
   TP/SL hit, drawdown ≥ 40%, hold > 240min, smart loss cut
 
@@ -242,6 +252,8 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 /execute coin:SOL          → full pipeline: prefilter → AI → execute if approved
 /execute coin:SOL bypass:true → skip prefilter + AI, execute immediately with defaults
 /scan                      → scan random pairs for trade setup (auto-retry 3×, 3min delay)
+                            Accept/Decline on trades, Suggest/Skip on skipped pairs
+                            "🔍 Scanning best pair…" displayed during search
 /status                    → open positions + live PnL
 /journal                   → today's trades (live from Hyperliquid, paginated)
 /journal week              → last 7 days
@@ -262,15 +274,17 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 ## 🛡️ Safety Layers
 
 ```
-Layer 1  Trend + S/R Gate (Go)         EMA spread < 0.2% → skip
+Layer 1  Trend Gate (Go)               EMA spread < 0.2% → skip
 Layer 2  Pre-filter Rules (Go)          RSI, EMA, volume, budget
-Layer 3  News Sentiment Gate (AI)       SKIP on exploits, hacks, SEC; WARN on unlocks, whales
+Layer 3  Market Context (free APIs)     Fear & Greed, funding, OI, L/S ratio
 Layer 4  AI Trade Scoring               confidence ≥ 55%, R:R ≥ 2.0, S/R aware
 Layer 5  Output Clamp (Go)             size 5–20%, leverage 1–10x
-Layer 6  Order Safety (Go)             limit only, 10min auto-cancel
-Layer 7  Position Hard Rules (Go)      drawdown, max hold, smart loss cut
-Layer 8  AI Position Management        hold/close/move SL/TP, S/R aware
-Layer 9  Discord Role Auth (Go)        only authorized role can interact
+Layer 6  Order Safety (Go)             limit only, cross margin
+Layer 7  User Confirmation (Discord)   Accept/Decline buttons on every trade
+Layer 8  Position Fill Check (Go)      waitForFill before monitoring + TP/SL
+Layer 9  Position Hard Rules (Go)      drawdown, max hold, smart loss cut
+Layer 10 AI Position Management        hold/close/move SL/TP, S/R aware
+Layer 11 Discord Role Auth (Go)        only authorized role can interact
 ```
 
 ---
@@ -316,7 +330,9 @@ Phase F  ✅  Position monitor (two-ticker)
 Phase G  ✅  Discord bot (slash commands, embeds, role auth)
 Phase H  ✅  Main scan loop (full wiring)
 
-Extras  ✅  News research agent (sentiment scan + gate decision)
+Extras  ✅  AI Suggest flow (advisory suggestions for skipped/wait/hold pairs)
+         ✅  TP/SL bracket orders (reduce-only, placed after position fill)
+         ✅  waitForFill (monitor confirms position exists before acting)
          ✅  Expanded pairs universe (174+ coins in common_pairs.json)
          ✅  Analysis log (per-cycle TA dump to analysis_log.json)
 
