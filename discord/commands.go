@@ -921,8 +921,10 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 		b.scanMu.Unlock()
 
 		if err != nil {
-			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Embeds: &[]*discordgo.MessageEmbed{{
+			s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+				Channel: i.ChannelID,
+				ID:      i.Message.ID,
+				Embeds:  &[]*discordgo.MessageEmbed{{
 					Title:       fmt.Sprintf("❌ AI Suggestion Failed — %s", sr.pair),
 					Description: err.Error(),
 					Color:       ColorRed,
@@ -931,7 +933,7 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 			return
 		}
 
-		b.showSuggestionResult(s, i, sr.pair, sr.taResult, sugg, sr.skipReason)
+		b.editSuggestionResult(s, i, sr.pair, sr.taResult, sugg, sr.skipReason)
 		return
 	}
 
@@ -955,8 +957,10 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 		b.scanMu.Unlock()
 
 		if err != nil {
-			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Embeds: &[]*discordgo.MessageEmbed{{
+			s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+				Channel: i.ChannelID,
+				ID:      i.Message.ID,
+				Embeds:  &[]*discordgo.MessageEmbed{{
 					Title:       fmt.Sprintf("❌ AI Suggestion Failed — %s", sr.pair),
 					Description: err.Error(),
 					Color:       ColorRed,
@@ -965,7 +969,7 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 			return
 		}
 
-		b.showSuggestionResult(s, i, sr.pair, sr.taResult, sugg, fmt.Sprintf("AI scored: %s (confidence %.0f%%)", sr.score.Action, sr.score.Confidence))
+		b.editSuggestionResult(s, i, sr.pair, sr.taResult, sugg, fmt.Sprintf("AI scored: %s (confidence %.0f%%)", sr.score.Action, sr.score.Confidence))
 		return
 	}
 
@@ -1092,6 +1096,128 @@ func (b *Bot) handleScanDecline(s *discordgo.Session, i *discordgo.InteractionCr
 	})
 }
 
+// handleSuggestExecute executes a trade based on the AI suggestion.
+func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	b.scanMu.Lock()
+	sr := b.activeScan
+	b.activeScan = nil
+	b.scanMu.Unlock()
+
+	if sr == nil {
+		b.respondAck(s, i, "⚠️ No active suggestion — run `/scan` first.")
+		return
+	}
+
+	ctx := context.Background()
+	var side exchange.OrderSide
+	if sr.score.Action == "open_long" {
+		side = exchange.OrderSideLong
+	} else {
+		side = exchange.OrderSideShort
+	}
+
+	orderResult, err := b.exClient.PlaceLimitOrder(ctx, sr.pair, side, sr.score.PositionSizeUSD, sr.taResult.CurrentPrice, sr.score.Leverage)
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ Order Failed — %s", sr.pair),
+					Description: err.Error(),
+					Color:       ColorRed,
+				}},
+				Components: []discordgo.MessageComponent{},
+			},
+		})
+		return
+	}
+
+	// Place TP and SL trigger orders
+	coinSize := sr.score.PositionSizeUSD / sr.taResult.CurrentPrice
+	b.placeTriggerOrders(ctx, sr.pair, side, coinSize, sr.score.StopLoss, sr.score.TakeProfit)
+
+	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sr.score.PositionSizeUSD, sr.score.Leverage,
+		sr.score.StopLoss, sr.score.TakeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
+
+	// Notify channel
+	b.SendEmbed(&discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("🚀 %s %s EXECUTED (suggestion)", sr.pair, strings.ToUpper(string(side))),
+		Description: fmt.Sprintf("**%s**", sr.score.Reasoning),
+		Color:       ColorGreen,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+			{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
+			{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
+			{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
+			{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+			{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
+			{Name: "Strategy", Value: sr.score.Strategy, Inline: true},
+			{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
+		},
+		Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+		Timestamp: time.Now().Format(time.RFC3339),
+	})
+
+	// Update button message
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{{
+				Title:       fmt.Sprintf("🚀 %s %s EXECUTED (suggestion)", sr.pair, strings.ToUpper(string(side))),
+				Description: fmt.Sprintf("Order placed at **$%.4f** | Order ID: **%d**\n%s",
+					orderResult.Price, orderResult.OrderID, sr.score.Reasoning),
+				Color: ColorGreen,
+				Fields: []*discordgo.MessageEmbedField{
+					{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+					{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
+					{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
+					{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
+					{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+					{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
+				},
+				Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+				Timestamp: time.Now().Format(time.RFC3339),
+			}},
+			Components: []discordgo.MessageComponent{},
+		},
+	})
+
+	slog.Info("scan: user executed suggestion",
+		"pair", sr.pair,
+		"action", sr.score.Action,
+		"entry", orderResult.Price,
+		"size", sr.score.PositionSizeUSD,
+		"order_id", orderResult.OrderID,
+	)
+}
+
+// handleSuggestSkip skips the AI suggestion.
+func (b *Bot) handleSuggestSkip(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	b.scanMu.Lock()
+	sr := b.activeScan
+	b.activeScan = nil
+	b.scanMu.Unlock()
+
+	pair := "unknown"
+	if sr != nil {
+		pair = sr.pair
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{{
+				Title:       fmt.Sprintf("❌ Skipped — %s", pair),
+				Description: "Run `/scan` again to search for a new setup.",
+				Color:       ColorRed,
+				Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
+				Timestamp:   time.Now().Format(time.RFC3339),
+			}},
+			Components: []discordgo.MessageComponent{},
+		},
+	})
+}
+
 // respondAck sends a quick ephemeral ACK to a component interaction.
 func (b *Bot) respondAck(s *discordgo.Session, i *discordgo.InteractionCreate, msg string) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -1167,14 +1293,17 @@ func (b *Bot) showSkippedPair(s *discordgo.Session, i *discordgo.InteractionCrea
 	}
 }
 
-// showSuggestionResult displays the AI advisory suggestion as a read-only embed.
-func (b *Bot) showSuggestionResult(s *discordgo.Session, i *discordgo.InteractionCreate, pair string, taResult ta.TAResult, sugg aiPkg.ScoreResult, contextReason string) {
+// editSuggestionResult edits the "analyzing..." message with the AI suggestion result + Execute/Skip buttons.
+// Auto-skip fires after 20 seconds of no response.
+func (b *Bot) editSuggestionResult(s *discordgo.Session, i *discordgo.InteractionCreate, pair string, taResult ta.TAResult, sugg aiPkg.ScoreResult, contextReason string) {
 	isTrade := sugg.Action == "open_long" || sugg.Action == "open_short"
 	color := ColorYellow
 	title := fmt.Sprintf("💡 AI Suggestion — %s", pair)
+	sideLabel := ""
 	if isTrade {
 		color = ColorGreen
-		title = fmt.Sprintf("💡 AI Suggestion — %s %s", pair, strings.ToUpper(strings.TrimPrefix(sugg.Action, "open_")))
+		sideLabel = " " + strings.ToUpper(strings.TrimPrefix(sugg.Action, "open_"))
+		title = fmt.Sprintf("💡 AI Suggestion — %s%s", pair, sideLabel)
 	}
 
 	desc := fmt.Sprintf("**%s**\n\nConfidence: **%.0f%%** | Strategy: **%s**",
@@ -1201,16 +1330,73 @@ func (b *Bot) showSuggestionResult(s *discordgo.Session, i *discordgo.Interactio
 		)
 	}
 
-	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+	// Store suggestion so button handlers can execute it
+	b.scanMu.Lock()
+	b.activeScan = &scanResult{
+		pair:     pair,
+		taResult: taResult,
+		mc:       market.MarketContext{},
+		state:    filter.BotState{},
+		score:    sugg,
+	}
+	b.scanMu.Unlock()
+
+	// Update the "analyzing..." message with the result + buttons
+	_, err := s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		Channel: i.ChannelID,
+		ID:      i.Message.ID,
 		Embeds: &[]*discordgo.MessageEmbed{{
 			Title:       title,
 			Description: desc,
 			Color:       color,
 			Fields:      fields,
-			Footer:      &discordgo.MessageEmbedFooter{Text: "This is an AI suggestion — use /execute to act on it. Always DYOR."},
+			Footer:      &discordgo.MessageEmbedFooter{Text: "Auto-skip in 20s if no response. AI suggestion — always DYOR."},
 			Timestamp:   time.Now().Format(time.RFC3339),
 		}},
+		Components: &[]discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    "🚀 Execute",
+						Style:    discordgo.SuccessButton,
+						CustomID: "suggest_execute",
+					},
+					discordgo.Button{
+						Label:    "❌ Skip",
+						Style:    discordgo.DangerButton,
+						CustomID: "suggest_skip",
+					},
+				},
+			},
+		},
 	})
+	if err != nil {
+		slog.Error("discord: edit suggestion result failed", "pair", pair, "err", err)
+	}
+
+	// Auto-skip after 20 seconds if no user response
+	go func() {
+		time.Sleep(20 * time.Second)
+		b.scanMu.Lock()
+		sr := b.activeScan
+		// only auto-skip if this is still the active suggestion (user didn't click anything)
+		if sr != nil && sr.pair == pair {
+			b.activeScan = nil
+			b.scanMu.Unlock()
+			slog.Info("scan: auto-skipping suggestion after 20s timeout",
+				"pair", pair,
+			)
+			// can't use InteractionResponseEdit on a message modified by FollowupMessageCreate
+			// just clear the buttons to indicate timeout
+			s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+				Channel: i.ChannelID,
+				ID:      i.Message.ID,
+				Components: &[]discordgo.MessageComponent{},
+			})
+		} else {
+			b.scanMu.Unlock()
+		}
+	}()
 }
 
 // handleExecute places a real order — either through the full AI pipeline or directly.

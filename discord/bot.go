@@ -319,6 +319,10 @@ func (b *Bot) registerCommands() error {
 			b.handleScanAccept(s, i)
 		case "scan_decline":
 			b.handleScanDecline(s, i)
+		case "suggest_execute":
+			b.handleSuggestExecute(s, i)
+		case "suggest_skip":
+			b.handleSuggestSkip(s, i)
 		}
 	})
 
