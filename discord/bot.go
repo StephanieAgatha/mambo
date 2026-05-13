@@ -8,8 +8,6 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
-	hyperliquid "github.com/sonirico/go-hyperliquid"
-
 	"mambo/config"
 	"mambo/exchange"
 	"mambo/journal"
@@ -164,21 +162,6 @@ func (b *Bot) SendEmbed(embed *discordgo.MessageEmbed) {
 	_, err := b.session.ChannelMessageSendEmbed(b.cfg.DiscordChannelID, embed)
 	if err != nil {
 		slog.Warn("discord: failed to send embed", "err", err)
-	}
-}
-
-// placeTriggerOrders submits TP and SL trigger orders to Hyperliquid.
-// Logs errors but does not fail — entry order already succeeded.
-func (b *Bot) placeTriggerOrders(ctx context.Context, pair string, side exchange.OrderSide, coinSize, stopLoss, takeProfit float64) {
-	if takeProfit > 0 {
-		if err := b.exClient.PlaceTriggerOrder(ctx, pair, side, coinSize, takeProfit, hyperliquid.TakeProfit); err != nil {
-			slog.Warn("discord: TP trigger order failed", "pair", pair, "tp", takeProfit, "err", err)
-		}
-	}
-	if stopLoss > 0 {
-		if err := b.exClient.PlaceTriggerOrder(ctx, pair, side, coinSize, stopLoss, hyperliquid.StopLoss); err != nil {
-			slog.Warn("discord: SL trigger order failed", "pair", pair, "sl", stopLoss, "err", err)
-		}
 	}
 }
 

@@ -1000,9 +1000,7 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 		return
 	}
 
-	// Place TP and SL trigger orders on Hyperliquid
-	coinSize := sr.score.PositionSizeUSD / sr.taResult.CurrentPrice
-	b.placeTriggerOrders(ctx, sr.pair, side, coinSize, sr.score.StopLoss, sr.score.TakeProfit)
+	// TP/SL placed by monitor after position fills — not here
 
 	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sr.score.PositionSizeUSD, sr.score.Leverage,
 		sr.score.StopLoss, sr.score.TakeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
@@ -1146,9 +1144,7 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 		return
 	}
 
-	// Place TP and SL trigger orders
-	coinSize := sizeUSD / sr.taResult.CurrentPrice
-	b.placeTriggerOrders(ctx, sr.pair, side, coinSize, sr.score.StopLoss, sr.score.TakeProfit)
+	// TP/SL placed by monitor after position fills — not here
 
 	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sizeUSD, leverage,
 		sr.score.StopLoss, sr.score.TakeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
@@ -1640,9 +1636,7 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			return
 		}
 
-		// Place TP and SL trigger orders
-		coinSize := score.PositionSizeUSD / taResult.CurrentPrice
-		b.placeTriggerOrders(ctx, coin, side, coinSize, score.StopLoss, score.TakeProfit)
+		// TP/SL placed by monitor after position fills — not here
 
 		b.NotifyTradeExecuted(coin, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
 
