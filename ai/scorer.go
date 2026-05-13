@@ -163,11 +163,20 @@ func (s *Scorer) Suggest(
 }
 
 // parseSuggestion extracts the <suggestion> JSON block from AI response.
+// Handles markdown code fences that AI might wrap the block in.
 func parseSuggestion(raw, pair string) (ScoreResult, error) {
+	// Strip markdown code fences around the block
+	cleaned := strings.ReplaceAll(raw, "```json", "")
+	cleaned = strings.ReplaceAll(cleaned, "```", "")
+
 	re := regexp.MustCompile(`(?s)<suggestion>(.*?)</suggestion>`)
-	matches := re.FindStringSubmatch(raw)
+	matches := re.FindStringSubmatch(cleaned)
 	if len(matches) < 2 {
-		slog.Warn("scorer: no <suggestion> block found — returning empty", "pair", pair)
+		slog.Warn("scorer: no <suggestion> block found — returning fallback",
+			"pair", pair,
+			"raw_len", len(raw),
+		)
+		slog.Debug("scorer: raw AI suggest response", "pair", pair, "raw", raw)
 		return ScoreResult{
 			Symbol:    pair,
 			Action:    "hold",
