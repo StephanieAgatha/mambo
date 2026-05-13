@@ -330,11 +330,20 @@ func (c *Client) PlaceTriggerOrder(
 	// Trigger orders reverse the side: a long position closes with a sell
 	isBuy := side == OrderSideShort
 
+	// Round size to the pair's szDecimals — same as entry order
+	decimals := c.szDecimalsForPair(ctx, pair)
+	roundFactor := math.Pow(10, float64(decimals))
+	coinSize = math.Round(coinSize*roundFactor) / roundFactor
+
+	if coinSize <= 0 {
+		return fmt.Errorf("exchange: place %s trigger failed pair=%s: coinSize rounded to 0", tpsl, pair)
+	}
+
 	req := hyperliquid.CreateOrderRequest{
 		Coin:       pair,
 		IsBuy:      isBuy,
 		Size:       coinSize,
-		Price:      triggerPrice,
+		Price:      0,
 		ReduceOnly: true,
 		OrderType: hyperliquid.OrderType{
 			Trigger: &hyperliquid.TriggerOrderType{
@@ -350,9 +359,19 @@ func (c *Client) PlaceTriggerOrder(
 		return fmt.Errorf("exchange: place %s trigger failed pair=%s px=%.4f: %w", tpsl, pair, triggerPrice, err)
 	}
 
+	if resp.Error != nil {
+		return fmt.Errorf("exchange: place %s trigger rejected pair=%s: %s", tpsl, pair, *resp.Error)
+	}
+
 	var orderID int64
 	if resp.Resting != nil {
 		orderID = resp.Resting.Oid
+	} else if resp.Filled != nil {
+		orderID = int64(resp.Filled.Oid)
+	}
+
+	if orderID == 0 {
+		return fmt.Errorf("exchange: place %s trigger returned no order ID pair=%s — order may have been silently rejected", tpsl, pair)
 	}
 
 	slog.Info("trigger order placed",
