@@ -316,6 +316,57 @@ func (c *Client) CancelOrder(ctx context.Context, pair string, orderID uint64) e
 	return nil
 }
 
+// PlaceTriggerOrder places a TP or SL trigger order on Hyperliquid.
+// tpsl must be hyperliquid.TakeProfit or hyperliquid.StopLoss.
+// coinSize is the position size in coins, used for the reduce-only closure.
+func (c *Client) PlaceTriggerOrder(
+	ctx context.Context,
+	pair string,
+	side OrderSide,
+	coinSize float64,
+	triggerPrice float64,
+	tpsl hyperliquid.Tpsl,
+) error {
+	// Trigger orders reverse the side: a long position closes with a sell
+	isBuy := side == OrderSideShort
+
+	req := hyperliquid.CreateOrderRequest{
+		Coin:       pair,
+		IsBuy:      isBuy,
+		Size:       coinSize,
+		Price:      triggerPrice,
+		ReduceOnly: true,
+		OrderType: hyperliquid.OrderType{
+			Trigger: &hyperliquid.TriggerOrderType{
+				TriggerPx: triggerPrice,
+				IsMarket:  true,
+				Tpsl:      tpsl,
+			},
+		},
+	}
+
+	resp, err := c.ex.Order(ctx, req, nil)
+	if err != nil {
+		return fmt.Errorf("exchange: place %s trigger failed pair=%s px=%.4f: %w", tpsl, pair, triggerPrice, err)
+	}
+
+	var orderID int64
+	if resp.Resting != nil {
+		orderID = resp.Resting.Oid
+	}
+
+	slog.Info("trigger order placed",
+		"pair", pair,
+		"tpsl", tpsl,
+		"trigger_px", triggerPrice,
+		"size_coins", coinSize,
+		"order_id", orderID,
+		"network", c.cfg.NetworkLabel(),
+	)
+
+	return nil
+}
+
 // FilledTrade represents a completed fill from Hyperliquid's userFills endpoint.
 type FilledTrade struct {
 	Coin      string

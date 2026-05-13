@@ -16,7 +16,17 @@ import (
 	"mambo/journal"
 	"mambo/market"
 	"mambo/ta"
+	aiPkg "mambo/ai"
 )
+
+// scanResult holds a scored pair waiting for user accept/decline.
+type scanResult struct {
+	pair     string
+	taResult ta.TAResult
+	mc       market.MarketContext
+	state    filter.BotState
+	score    aiPkg.ScoreResult
+}
 
 // handleStatus shows all open positions with live PnL.
 func (b *Bot) handleStatus(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -530,8 +540,10 @@ func (b *Bot) handleCapital(s *discordgo.Session, i *discordgo.InteractionCreate
 }
 
 // handleScan runs the full scan loop: fetches balance, picks random pairs, pre-filters, and scores with AI.
-// Responds immediately with "searching..." then edits once a result is found or all pairs exhausted.
-// If no trade is found, sleeps 3 minutes and retries up to 3 total scan cycles.
+// Keeps displaying "🔍 Scanning best pair…" during the search.
+// When a scored pair is found (trade, hold, or wait), shows the result with Accept/Decline buttons.
+// On Accept → execute trade (or acknowledge hold/wait). On Decline → scan continues.
+// If no trade is found after all cycles, shows "No Trade Found".
 func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
@@ -548,6 +560,16 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		ctx := context.Background()
 		totalScanned := 0
 		globalSeen := make(map[string]bool)
+
+		updateScanning := func() {
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Embeds: &[]*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("🔍 Scanning best pair… (%d scanned)", totalScanned),
+					Description: "Searching for a qualifying trade setup across the market.",
+					Color:       ColorBlue,
+				}},
+			})
+		}
 
 		for cycle := 0; cycle < maxScanCycles; cycle++ {
 			if cycle > 0 {
@@ -679,6 +701,11 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					return
 				}
 
+				// Periodically update the scanning message
+				if totalScanned%5 == 0 {
+					updateScanning()
+				}
+
 				aiScored++
 				score, err := b.scorer.Score(ctx, pair, taResult, mc, state)
 				if err != nil {
@@ -713,34 +740,13 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					AIDecision: aiLog,
 				})
 
-				switch score.Action {
-				case "open_long", "open_short":
-					b.NotifyTradeExecuted(pair, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
-					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-						Embeds: &[]*discordgo.MessageEmbed{{
-							Title:       fmt.Sprintf("🚀 Trade Found — %s", pair),
-							Description: fmt.Sprintf("**%s** — %s", strings.ToUpper(score.Action), score.Reasoning),
-							Color:       ColorGreen,
-							Fields: []*discordgo.MessageEmbedField{
-								{Name: "Entry", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
-								{Name: "SL", Value: fmt.Sprintf("$%.4f", score.StopLoss), Inline: true},
-								{Name: "TP", Value: fmt.Sprintf("$%.4f", score.TakeProfit), Inline: true},
-								{Name: "Size", Value: fmt.Sprintf("$%.2f", score.PositionSizeUSD), Inline: true},
-								{Name: "Leverage", Value: fmt.Sprintf("%dx", score.Leverage), Inline: true},
-								{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
-								{Name: "Strategy", Value: score.Strategy, Inline: true},
-								{Name: "R:R", Value: fmt.Sprintf("%.2f", score.RRRatio), Inline: true},
-							},
-							Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
-							Timestamp: time.Now().Format(time.RFC3339),
-						}},
-					})
-					return
-
-				default:
-					continue
-				}
+				// Any scored pair (trade, hold, wait) — show result with buttons
+				b.showScanResult(s, i, pair, taResult, mc, state, score)
+				return
 			}
+
+			// cycle finished, update scanning status
+			updateScanning()
 		}
 
 		// all cycles exhausted — no trade found
@@ -754,6 +760,299 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			}},
 		})
 	}()
+}
+
+// showScanResult displays the AI score decision with Accept/Decline buttons.
+// Stores the result in Bot.activeScan so the button handlers can reference it.
+func (b *Bot) showScanResult(s *discordgo.Session, i *discordgo.InteractionCreate, pair string, taResult ta.TAResult, mc market.MarketContext, state filter.BotState, score aiPkg.ScoreResult) {
+	isTrade := score.Action == "open_long" || score.Action == "open_short"
+
+	var title, desc string
+	if isTrade {
+		title = fmt.Sprintf("🚀 Scan Complete — %s", pair)
+		desc = fmt.Sprintf("**%s** with confidence **%.0f%%**\nEntry: **$%.4f** | SL: **$%.4f** | TP: **$%.4f**\n%s",
+			strings.ToUpper(score.Action),
+			score.Confidence,
+			taResult.CurrentPrice,
+			score.StopLoss,
+			score.TakeProfit,
+			score.Reasoning,
+		)
+	} else {
+		title = fmt.Sprintf("⏸️ Scan Complete — %s (%s)", pair, strings.ToUpper(score.Action))
+		desc = fmt.Sprintf("**%s** — %s\nConfidence: **%.0f%%** | Strategy: **%s**",
+			strings.ToUpper(score.Action),
+			score.Reasoning,
+			score.Confidence,
+			score.Strategy,
+		)
+	}
+
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Price", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+		{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
+		{Name: "Strategy", Value: score.Strategy, Inline: true},
+	}
+
+	if isTrade {
+		fields = append(fields,
+			&discordgo.MessageEmbedField{Name: "Entry", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
+			&discordgo.MessageEmbedField{Name: "SL", Value: fmt.Sprintf("$%.4f", score.StopLoss), Inline: true},
+			&discordgo.MessageEmbedField{Name: "TP", Value: fmt.Sprintf("$%.4f", score.TakeProfit), Inline: true},
+			&discordgo.MessageEmbedField{Name: "Size", Value: fmt.Sprintf("$%.2f", score.PositionSizeUSD), Inline: true},
+			&discordgo.MessageEmbedField{Name: "Leverage", Value: fmt.Sprintf("%dx", score.Leverage), Inline: true},
+			&discordgo.MessageEmbedField{Name: "R:R", Value: fmt.Sprintf("%.2f", score.RRRatio), Inline: true},
+		)
+	}
+
+	fields = append(fields,
+		&discordgo.MessageEmbedField{Name: "Confluence", Value: fmt.Sprintf("%d signals", score.ConfluenceCount), Inline: true},
+	)
+
+	channelID := i.ChannelID
+
+	// Store active scan so button handlers can read it
+	b.scanMu.Lock()
+	b.activeScan = &scanResult{
+		pair:     pair,
+		taResult: taResult,
+		mc:       mc,
+		state:    state,
+		score:    score,
+	}
+	b.scanChannelID = channelID
+	b.scanMu.Unlock()
+
+	acceptLabel := "✅ Accept"
+	declineLabel := "❌ Decline"
+	if !isTrade {
+		acceptLabel = "✅ Acknowledge"
+		declineLabel = "❌ Skip"
+	}
+
+	msg := &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{{
+				Title:       title,
+				Description: desc,
+				Color:       ColorYellow,
+				Fields:      fields,
+				Footer:      &discordgo.MessageEmbedFooter{Text: fmt.Sprintf("Do you accept this %s?", score.Action)},
+				Timestamp:   time.Now().Format(time.RFC3339),
+			}},
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.Button{
+							Label:    acceptLabel,
+							Style:    discordgo.SuccessButton,
+							CustomID: "scan_accept",
+						},
+						discordgo.Button{
+							Label:    declineLabel,
+							Style:    discordgo.DangerButton,
+							CustomID: "scan_decline",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Send a new follow-up message with buttons instead of editing the deferred response.
+	// First clear the "scanning" deferred message, then send the result.
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds: &[]*discordgo.MessageEmbed{{
+			Title:       "🔍 Scan Ready",
+			Description: fmt.Sprintf("Found a setup for **%s**. See below for details.", pair),
+			Color:       ColorBlue,
+		}},
+	})
+
+	// Send follow-up with buttons
+	_, err := s.FollowupMessageCreate(i.Interaction, false, &discordgo.WebhookParams{
+		Embeds:     msg.Data.Embeds,
+		Components: msg.Data.Components,
+	})
+	if err != nil {
+		slog.Error("discord: scan follow-up with buttons failed", "pair", pair, "err", err)
+	}
+}
+
+// handleScanAccept handles the Accept/Acknowledge button click.
+func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	b.scanMu.Lock()
+	sr := b.activeScan
+	b.scanMu.Unlock()
+
+	if sr == nil {
+		b.respondAck(s, i, "⚠️ No active scan — run `/scan` first.")
+		return
+	}
+
+	ctx := context.Background()
+	isTrade := sr.score.Action == "open_long" || sr.score.Action == "open_short"
+
+	if !isTrade {
+		// hold or wait — user acknowledged, clear state
+		b.scanMu.Lock()
+		b.activeScan = nil
+		b.scanMu.Unlock()
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("⏸️ Acknowledged — %s (%s)", sr.pair, strings.ToUpper(sr.score.Action)),
+					Description: fmt.Sprintf("Strategy: **%s** | Confidence: **%.0f%%**\n%s",
+						sr.score.Strategy, sr.score.Confidence, sr.score.Reasoning),
+					Color:       ColorBlue,
+					Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
+					Timestamp:   time.Now().Format(time.RFC3339),
+				}},
+				Components: []discordgo.MessageComponent{}, // remove buttons
+			},
+		})
+		slog.Info("scan: user acknowledged hold/wait",
+			"pair", sr.pair,
+			"action", sr.score.Action,
+		)
+		return
+	}
+
+	// Trade action — place order
+	var side exchange.OrderSide
+	if sr.score.Action == "open_long" {
+		side = exchange.OrderSideLong
+	} else {
+		side = exchange.OrderSideShort
+	}
+
+	orderResult, err := b.exClient.PlaceLimitOrder(ctx, sr.pair, side, sr.score.PositionSizeUSD, sr.taResult.CurrentPrice, sr.score.Leverage)
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("❌ Order Failed — %s", sr.pair),
+					Description: err.Error(),
+					Color:       ColorRed,
+				}},
+				Components: []discordgo.MessageComponent{},
+			},
+		})
+		b.scanMu.Lock()
+		b.activeScan = nil
+		b.scanMu.Unlock()
+		return
+	}
+
+	// Place TP and SL trigger orders on Hyperliquid
+	coinSize := sr.score.PositionSizeUSD / sr.taResult.CurrentPrice
+	b.placeTriggerOrders(ctx, sr.pair, side, coinSize, sr.score.StopLoss, sr.score.TakeProfit)
+
+	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sr.score.PositionSizeUSD, sr.score.Leverage,
+		sr.score.StopLoss, sr.score.TakeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
+
+	b.scanMu.Lock()
+	b.activeScan = nil
+	b.scanMu.Unlock()
+
+	// Send notify embed
+	b.SendEmbed(&discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("🚀 %s %s EXECUTED", sr.pair, strings.ToUpper(string(side))),
+		Description: fmt.Sprintf("**%s**", sr.score.Reasoning),
+		Color:       ColorGreen,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+			{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
+			{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
+			{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
+			{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+			{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
+			{Name: "Strategy", Value: sr.score.Strategy, Inline: true},
+			{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
+		},
+		Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+		Timestamp: time.Now().Format(time.RFC3339),
+	})
+
+	// Update the button message
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{{
+				Title:       fmt.Sprintf("🚀 %s %s EXECUTED", sr.pair, strings.ToUpper(string(side))),
+				Description: fmt.Sprintf("Order placed at **$%.4f** | Order ID: **%d**\n%s",
+					orderResult.Price, orderResult.OrderID, sr.score.Reasoning),
+				Color: ColorGreen,
+				Fields: []*discordgo.MessageEmbedField{
+					{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
+					{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
+					{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
+					{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
+					{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+					{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
+				},
+				Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
+				Timestamp: time.Now().Format(time.RFC3339),
+			}},
+			Components: []discordgo.MessageComponent{},
+		},
+	})
+
+	slog.Info("scan: user accepted trade",
+		"pair", sr.pair,
+		"action", sr.score.Action,
+		"entry", orderResult.Price,
+		"size", sr.score.PositionSizeUSD,
+		"order_id", orderResult.OrderID,
+	)
+}
+
+// handleScanDecline handles the Decline/Skip button click.
+// Clears the active scan and indicates a new scan should be started.
+func (b *Bot) handleScanDecline(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	b.scanMu.Lock()
+	sr := b.activeScan
+	b.activeScan = nil
+	b.scanMu.Unlock()
+
+	if sr == nil {
+		b.respondAck(s, i, "⚠️ No active scan — run `/scan` first.")
+		return
+	}
+
+	slog.Info("scan: user declined",
+		"pair", sr.pair,
+		"action", sr.score.Action,
+	)
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{{
+				Title:       fmt.Sprintf("❌ Declined — %s", sr.pair),
+				Description: "Run `/scan` again to search for a new setup.",
+				Color:       ColorRed,
+				Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
+				Timestamp:   time.Now().Format(time.RFC3339),
+			}},
+			Components: []discordgo.MessageComponent{},
+		},
+	})
+}
+
+// respondAck sends a quick ephemeral ACK to a component interaction.
+func (b *Bot) respondAck(s *discordgo.Session, i *discordgo.InteractionCreate, msg string) {
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: msg,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
 }
 
 // handleExecute places a real order — either through the full AI pipeline or directly.
@@ -981,6 +1280,10 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			})
 			return
 		}
+
+		// Place TP and SL trigger orders
+		coinSize := score.PositionSizeUSD / taResult.CurrentPrice
+		b.placeTriggerOrders(ctx, coin, side, coinSize, score.StopLoss, score.TakeProfit)
 
 		b.NotifyTradeExecuted(coin, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
 

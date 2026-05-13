@@ -18,6 +18,12 @@ const (
 	// maxHoldDuration: force close after 240 minutes (1 trading session)
 	maxHoldDuration = 240 * time.Minute
 
+	// maxWaitFillDuration: max time to wait for limit order to fill before giving up
+	maxWaitFillDuration = 120 * time.Minute
+
+	// fillPollInterval: how often to check if position has filled
+	fillPollInterval = 15 * time.Second
+
 	// smartLossCutDuration: how long a position must be losing before smart cut kicks in
 	smartLossCutDuration = 30 * time.Minute
 
@@ -92,7 +98,42 @@ func (m *Monitor) Start(ctx context.Context, pos journal.OpenPosition) {
 // Two separate tickers:
 //   - priceTicker: cfg.MonitorPriceSec  → check price + hard rules (fast)
 //   - aiTicker   : cfg.MonitorAISec     → call Grok for analysis (slower, configurable)
+//
+// Before entering the loop, waits for the position to actually fill on the exchange.
 func (m *Monitor) watch(ctx context.Context, pos journal.OpenPosition) {
+	slog.Info("monitor: waiting for position to fill",
+		"pos_id", pos.ID,
+		"pair", pos.Pair,
+		"direction", pos.Direction,
+		"entry", pos.EntryPrice,
+		"size_usd", pos.SizeUSD,
+	)
+
+	filled := m.waitForFill(ctx, pos)
+	if !filled {
+		// position was placed on startup but not yet filled
+		// clean up the position record since order didn't fill
+		slog.Warn("monitor: position fill timed out — cleaning up",
+			"pos_id", pos.ID, "pair", pos.Pair)
+		// IMPORTANT: Do NOT log this as a trade — order never filled
+		if err := m.jl.RemovePosition(pos.ID); err != nil {
+			slog.Error("monitor: remove unfilled position failed", "pos_id", pos.ID, "err", err)
+		}
+		return
+	}
+
+	// Position is now filled — ready for monitoring
+	pos.Status = "filled"
+	if err := m.jl.SavePosition(pos); err != nil {
+		slog.Warn("monitor: update position status to filled failed", "pos_id", pos.ID, "err", err)
+	}
+
+	slog.Info("monitor: position confirmed filled — starting monitoring",
+		"pos_id", pos.ID,
+		"pair", pos.Pair,
+		"entry", pos.EntryPrice,
+	)
+
 	priceTicker := time.NewTicker(time.Duration(m.cfg.MonitorPriceSec) * time.Second)
 	aiTicker := time.NewTicker(time.Duration(m.cfg.MonitorAISec) * time.Second)
 	defer priceTicker.Stop()
@@ -364,6 +405,64 @@ func (m *Monitor) fetchTASnapshot(ctx context.Context, pair string) (ta.TAResult
 		return ta.TAResult{}, fmt.Errorf("monitor: fetch OHLCV pair=%s: %w", pair, err)
 	}
 	return ta.Calculate(candles)
+}
+
+// waitForFill polls the exchange until the position appears or timeout is reached.
+// Returns true if the position filled, false on timeout.
+func (m *Monitor) waitForFill(ctx context.Context, pos journal.OpenPosition) bool {
+	deadline := time.Now().Add(maxWaitFillDuration)
+
+	// immediate check — don't wait 15s on fresh placements or restarts
+	if m.hasPositionOnExchange(ctx, pos) {
+		slog.Info("monitor: position already filled on exchange",
+			"pos_id", pos.ID, "pair", pos.Pair)
+		return true
+	}
+
+	poll := time.NewTicker(fillPollInterval)
+	defer poll.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-poll.C:
+			if m.hasPositionOnExchange(ctx, pos) {
+				slog.Info("monitor: position filled on exchange",
+					"pos_id", pos.ID, "pair", pos.Pair)
+				return true
+			}
+
+			slog.Debug("monitor: position not yet filled — waiting",
+				"pos_id", pos.ID, "pair", pos.Pair)
+		}
+
+		if time.Now().After(deadline) {
+			slog.Warn("monitor: position fill timeout",
+				"pos_id", pos.ID,
+				"pair", pos.Pair,
+				"elapsed_min", fmt.Sprintf("%.0f", maxWaitFillDuration.Minutes()),
+			)
+			return false
+		}
+	}
+}
+
+// hasPositionOnExchange checks if a matching position exists on Hyperliquid.
+func (m *Monitor) hasPositionOnExchange(ctx context.Context, pos journal.OpenPosition) bool {
+	positions, err := m.exClient.FetchPositions(ctx)
+	if err != nil {
+		slog.Warn("monitor: fetch positions failed — assuming not filled",
+			"pos_id", pos.ID, "pair", pos.Pair, "err", err)
+		return false
+	}
+
+	for _, p := range positions {
+		if p.Pair == pos.Pair && p.Side == pos.Direction {
+			return true
+		}
+	}
+	return false
 }
 
 // ── PnL + TP/SL Helpers ───────────────────────────────────────────────────────

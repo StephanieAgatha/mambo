@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
+
+	hyperliquid "github.com/sonirico/go-hyperliquid"
 
 	"mambo/config"
 	"mambo/exchange"
@@ -25,6 +28,11 @@ type Bot struct {
 	exClient *exchange.Client
 	mon      *monitor.Monitor
 	mode     string // "auto" | "manual"
+
+	scanMu        sync.Mutex
+	activeScan    *scanResult // non-nil = waiting for user accept/decline
+	scanMessageID string      // the message with buttons
+	scanChannelID string      // channel where buttons were sent
 }
 
 // hasAuthorizedRole checks if a Discord member has the authorized role.
@@ -159,6 +167,21 @@ func (b *Bot) SendEmbed(embed *discordgo.MessageEmbed) {
 	}
 }
 
+// placeTriggerOrders submits TP and SL trigger orders to Hyperliquid.
+// Logs errors but does not fail — entry order already succeeded.
+func (b *Bot) placeTriggerOrders(ctx context.Context, pair string, side exchange.OrderSide, coinSize, stopLoss, takeProfit float64) {
+	if takeProfit > 0 {
+		if err := b.exClient.PlaceTriggerOrder(ctx, pair, side, coinSize, takeProfit, hyperliquid.TakeProfit); err != nil {
+			slog.Warn("discord: TP trigger order failed", "pair", pair, "tp", takeProfit, "err", err)
+		}
+	}
+	if stopLoss > 0 {
+		if err := b.exClient.PlaceTriggerOrder(ctx, pair, side, coinSize, stopLoss, hyperliquid.StopLoss); err != nil {
+			slog.Warn("discord: SL trigger order failed", "pair", pair, "sl", stopLoss, "err", err)
+		}
+	}
+}
+
 // registration creates all slash commands on the configured guild.
 func (b *Bot) registerCommands() error {
 	commands := []*discordgo.ApplicationCommand{
@@ -280,6 +303,22 @@ func (b *Bot) registerCommands() error {
 			b.handleScan(s, i)
 		case "execute":
 			b.handleExecute(s, i)
+		}
+	})
+
+	// Handle message component interactions (accept/decline buttons from /scan)
+	b.session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		if i.Type != discordgo.InteractionMessageComponent {
+			return
+		}
+		if !hasAuthorizedRole(i.Member, b.cfg.DiscordAuthorizedRoleID) {
+			return
+		}
+		switch i.MessageComponentData().CustomID {
+		case "scan_accept":
+			b.handleScanAccept(s, i)
+		case "scan_decline":
+			b.handleScanDecline(s, i)
 		}
 	})
 
