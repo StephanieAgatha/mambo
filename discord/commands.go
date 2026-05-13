@@ -902,9 +902,17 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 
 	if sr.suggestMode {
 		// Prefilter skipped pair — run AI Suggest for advisory opinion
-		// Update the deferred message to "thinking..."
+		// Show "analyzing..." while AI processes
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("🔍 Analyzing %s... hold on…", sr.pair),
+					Description: "AI is analyzing this pair and preparing a trade suggestion.",
+					Color:       ColorBlue,
+				}},
+				Components: []discordgo.MessageComponent{}, // remove buttons
+			},
 		})
 
 		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state)
@@ -930,7 +938,15 @@ func (b *Bot) handleScanAccept(s *discordgo.Session, i *discordgo.InteractionCre
 	if !isTrade {
 		// AI already scored this as hold/wait — run AI Suggest for advisory opinion
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{{
+					Title:       fmt.Sprintf("🔍 Analyzing %s... hold on…", sr.pair),
+					Description: "AI is analyzing this pair and preparing a trade suggestion.",
+					Color:       ColorBlue,
+				}},
+				Components: []discordgo.MessageComponent{},
+			},
 		})
 
 		sugg, err := b.scorer.Suggest(ctx, sr.pair, sr.taResult, sr.mc, sr.state)
