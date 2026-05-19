@@ -228,7 +228,7 @@ func (s *Scorer) Execute(
 		return ScoreResult{}, fmt.Errorf("scorer: parse execute failed pair=%s: %w", pair, err)
 	}
 
-	result = s.validateAndClamp(result, state)
+	result = s.clampExecute(result, state)
 
 	// Ensure direction is always set
 	if result.Direction == "" {
@@ -539,6 +539,48 @@ func (s *Scorer) validateAndClamp(result ScoreResult, state filter.BotState) Sco
 	}
 
 	result.PositionSizeUSD = math.Round(result.PositionSizeUSD*100) / 100
+
+	return result
+}
+
+// clampExecute forces sane values for /execute (never changes action to "wait").
+// AI can return leverage=0, confidence=0 — we clamp to minimums but always execute.
+func (s *Scorer) clampExecute(result ScoreResult, state filter.BotState) ScoreResult {
+	// Force leverage to 1-10 range
+	if result.Leverage < config.MinLeverageX {
+		slog.Debug("execute: clamp leverage up", "from", result.Leverage, "to", config.MinLeverageX)
+		result.Leverage = config.MinLeverageX
+	}
+	if result.Leverage > config.MaxLeverageX {
+		slog.Debug("execute: clamp leverage down", "from", result.Leverage, "to", config.MaxLeverageX)
+		result.Leverage = config.MaxLeverageX
+	}
+
+	// Force minimum size
+	minSize := state.Balance * config.MinSizePct
+	if result.PositionSizeUSD < minSize {
+		slog.Debug("execute: clamp size up", "from", result.PositionSizeUSD, "to", minSize)
+		result.PositionSizeUSD = minSize
+	}
+	maxSize := state.Balance * config.MaxSizePct
+	if result.PositionSizeUSD > maxSize {
+		slog.Debug("execute: clamp size down", "from", result.PositionSizeUSD, "to", maxSize)
+		result.PositionSizeUSD = maxSize
+	}
+
+	// Clamp to remaining risk budget
+	remaining := filter.RemainingBudget(state)
+	if result.PositionSizeUSD > remaining {
+		slog.Debug("execute: clamp to remaining budget", "from", result.PositionSizeUSD, "to", remaining)
+		result.PositionSizeUSD = remaining
+	}
+
+	result.PositionSizeUSD = math.Round(result.PositionSizeUSD*100) / 100
+
+	// Force minimum confidence display
+	if result.Confidence <= 0 {
+		result.Confidence = 50
+	}
 
 	return result
 }
