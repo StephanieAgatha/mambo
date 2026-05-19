@@ -80,29 +80,6 @@ func (b *Bot) handleCheck(s *discordgo.Session, i *discordgo.InteractionCreate) 
 		TotalAtRiskUSD:    0,
 	}
 
-	filterResult := filter.ApplyPreFilter(coin, taResult, state)
-	if !filterResult.Pass {
-		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Embeds: &[]*discordgo.MessageEmbed{{
-				Title:       fmt.Sprintf("⏭️ %s — Skipped", coin),
-				Description: filterResult.Reason,
-				Color:       ColorYellow,
-				Fields: []*discordgo.MessageEmbedField{
-					{Name: "Price", Value: fmt.Sprintf("$%.4f", taResult.CurrentPrice), Inline: true},
-					{Name: "RSI", Value: fmt.Sprintf("%.2f (%s)", taResult.RSI, taResult.RSIZone), Inline: true},
-					{Name: "EMA Spread", Value: fmt.Sprintf("%.3f%%", taResult.EMASpread), Inline: true},
-					{Name: "EMA200", Value: fmt.Sprintf("$%.4f", taResult.EMA200), Inline: true},
-					{Name: "Ribbon", Value: taResult.RibbonStatus, Inline: true},
-					{Name: "Support", Value: fmt.Sprintf("$%.4f (%s)", taResult.NearestSupport, taResult.SupportStrength), Inline: true},
-					{Name: "Resistance", Value: fmt.Sprintf("$%.4f (%s)", taResult.NearestResistance, taResult.ResistanceStrength), Inline: true},
-				},
-				Footer:    &discordgo.MessageEmbedFooter{Text: "All rules checked — no exceptions."},
-				Timestamp: time.Now().Format(time.RFC3339),
-			}},
-		})
-		return
-	}
-
 	score, err := b.scorer.Score(ctx, coin, taResult, mc, state)
 	if err != nil {
 		slog.Error("discord: /check AI scoring failed", "coin", coin, "err", err)

@@ -142,11 +142,7 @@ func (b *Bot) handleTVWithLocalTA(s *discordgo.Session, i *discordgo.Interaction
 		ConsecutiveLosses: consecLosses,
 	}
 
-	var prefilterReason string
-	filterResult := filter.ApplyPreFilter(coin, taResult, state)
-	if !filterResult.Pass {
-		prefilterReason = filterResult.Reason
-	}
+	prefilterReason := ""
 
 	score, err := b.scorer.Score(ctx, coin, taResult, mc, state)
 	if err != nil {

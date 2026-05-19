@@ -468,6 +468,67 @@ func (f *Fetcher) FetchAltfinsSnapshot(ctx context.Context, coin, timeInterval s
 	return entry, nil
 }
 
+// FetchAltfinsBatchSnapshot fetches latest OHLCV candles for multiple symbols in one API call.
+// timeInterval: "DAILY" | "HOURLY" | "WEEKLY" | "MONTHLY"
+// Returns a map of symbol → candle. Symbols not found (empty array) are omitted.
+func (f *Fetcher) FetchAltfinsBatchSnapshot(ctx context.Context, symbols []string, timeInterval string) (map[string]AltfinsOHLCV, error) {
+	if f.cfg.AltfinsAPIKey == "" {
+		return nil, fmt.Errorf("fetcher: ALTFINS_API_KEY not configured")
+	}
+
+	body := map[string]any{
+		"symbols":      symbols,
+		"timeInterval": timeInterval,
+	}
+
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: marshal altfins batch request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, config.AltfinsAPIURL, bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: build altfins batch request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-API-KEY", f.cfg.AltfinsAPIKey)
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: altfins batch request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: read altfins batch response: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		limit := min(500, len(raw))
+		return nil, fmt.Errorf("fetcher: altfins batch returned %d: %s", resp.StatusCode, string(raw[:limit]))
+	}
+
+	var result AltfinsResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("fetcher: parse altfins batch response: %w", err)
+	}
+
+	out := make(map[string]AltfinsOHLCV, len(result))
+	for _, entry := range result {
+		out[entry.Symbol] = entry
+	}
+
+	slog.Debug("altfins batch snapshot fetched",
+		"symbols", len(symbols),
+		"results", len(out),
+		"interval", timeInterval,
+	)
+
+	return out, nil
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // estimateDuration returns an approximate look-back window for N candles.

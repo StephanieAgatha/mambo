@@ -642,24 +642,6 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					continue
 				}
 
-				filterResult := filter.ApplyPreFilter(pair, taResult, state)
-				if !filterResult.Pass {
-					if filterResult.SkipAll {
-						b.NotifyDailyLimit(filterResult.Reason)
-						s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-							Embeds: &[]*discordgo.MessageEmbed{{
-								Title:       "🛑 Scan Halted",
-								Description: filterResult.Reason,
-								Color:       ColorRed,
-							}},
-						})
-						return
-					}
-					// Offer Suggest on prefilter skip — let AI give advisory opinion
-					b.showSkippedPair(s, i, pair, taResult, mc, state, filterResult.Reason)
-					return
-				}
-
 				if !b.cfg.EnableAI {
 					orderResult, err := b.exClient.PlaceLimitOrder(
 						ctx,

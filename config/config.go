@@ -109,8 +109,6 @@ type Config struct {
 	AltfinsAPIKey string // env: ALTFINS_API_KEY
 }
 
-var PreFilterEnabled bool = true
-
 // Load reads .env then validates all required environment variables.
 func Load() (*Config, error) {
 	if err := godotenv.Load(); err != nil {
@@ -146,19 +144,6 @@ func Load() (*Config, error) {
 		cfg.HyperliquidAPIURL = HyperliquidTestnetURL
 	} else {
 		cfg.HyperliquidAPIURL = HyperliquidMainnetURL
-	}
-
-	// ── Pre‑filter toggle ──────────────────────────────────────────────────
-	preFilterStr := os.Getenv("ENABLE_PREFILTER")
-	if preFilterStr == "" {
-		PreFilterEnabled = true // default menyala
-	} else {
-		enabled, err := strconv.ParseBool(preFilterStr)
-		if err != nil {
-			PreFilterEnabled = true
-		} else {
-			PreFilterEnabled = enabled
-		}
 	}
 
 	// ── AI Provider ───────────────────────────────────────────────────────────
