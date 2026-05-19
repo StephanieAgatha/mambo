@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -32,18 +33,58 @@ func NewClient(cfg *config.Config, timeout time.Duration) *Client {
 }
 
 // Chat sends a system + user prompt to the configured AI provider
-// and returns the raw text response.
+// and returns the raw text response. Retries on transient errors (502, 503, 500).
 func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	switch c.cfg.AIProvider {
-	case config.ProviderAnthropic:
-		// Anthropic uses a different API format — not OpenAI-compatible
-		return c.chatAnthropic(ctx, systemPrompt, userPrompt)
-	default:
-		// Grok, OpenAI, DeepSeek are all OpenAI-compatible
-		return c.chatOpenAICompatible(ctx, systemPrompt, userPrompt)
+	const maxRetries = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt) * 2 * time.Second
+			slog.Warn("ai/client: retrying after error", "attempt", attempt+1, "delay", delay, "err", lastErr)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+
+		var result string
+		var err error
+
+		switch c.cfg.AIProvider {
+		case config.ProviderAnthropic:
+			result, err = c.chatAnthropic(ctx, systemPrompt, userPrompt)
+		default:
+			result, err = c.chatOpenAICompatible(ctx, systemPrompt, userPrompt)
+		}
+
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+
+		// Only retry on transient errors (5xx, timeout)
+		if !isRetryable(err) {
+			return "", err
+		}
 	}
+
+	return "", fmt.Errorf("ai/client: all %d attempts failed: %w", maxRetries, lastErr)
 }
 
+// isRetryable returns true for transient server errors (5xx, timeouts).
+func isRetryable(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "status=500") ||
+		strings.Contains(s, "status=502") ||
+		strings.Contains(s, "status=503") ||
+		strings.Contains(s, "status=504") ||
+		strings.Contains(s, "Timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "EOF")
+}
 // chatOpenAICompatible handles Grok, OpenAI, and DeepSeek.
 // All three use the same /chat/completions format with Bearer token auth.
 func (c *Client) chatOpenAICompatible(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
