@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"time"
 
-	hyperliquid "github.com/sonirico/go-hyperliquid"
-
 	"mambo/ai"
 	"mambo/config"
 	"mambo/exchange"
@@ -130,9 +128,7 @@ func (m *Monitor) watch(ctx context.Context, pos journal.OpenPosition) {
 		slog.Warn("monitor: update position status to filled failed", "pos_id", pos.ID, "err", err)
 	}
 
-	// Place TP/SL trigger orders now that position exists on exchange
-	coinSize := pos.SizeUSD / pos.EntryPrice
-	m.placeTPandSL(ctx, pos, coinSize)
+	// TP/SL already live via PlaceBracketOrder (atomic entry+TP+SL) — no trigger placement needed
 
 	slog.Info("monitor: position confirmed filled — starting monitoring",
 		"pos_id", pos.ID,
@@ -406,7 +402,7 @@ func (m *Monitor) closePosition(
 
 // fetchTASnapshot fetches fresh candles and calculates a TA snapshot for AI decision.
 func (m *Monitor) fetchTASnapshot(ctx context.Context, pair string) (ta.TAResult, error) {
-	candles, err := m.fetcher.FetchOHLCV(ctx, pair, "4h", 200)
+	candles, err := m.fetcher.FetchOHLCV(ctx, pair, m.cfg.MonitorAIIntvl, 200)
 	if err != nil {
 		return ta.TAResult{}, fmt.Errorf("monitor: fetch OHLCV pair=%s: %w", pair, err)
 	}
@@ -469,23 +465,6 @@ func (m *Monitor) hasPositionOnExchange(ctx context.Context, pos journal.OpenPos
 		}
 	}
 	return false
-}
-
-// placeTPandSL submits TP and SL trigger orders after position is confirmed filled.
-// Doesn't return errors — logs at ERROR level so failures are visible.
-func (m *Monitor) placeTPandSL(ctx context.Context, pos journal.OpenPosition, coinSize float64) {
-	if pos.TakeProfit > 0 {
-		if err := m.exClient.PlaceTriggerOrder(ctx, pos.Pair, pos.Direction, coinSize, pos.TakeProfit, hyperliquid.TakeProfit); err != nil {
-			slog.Error("monitor: TP trigger order FAILED — will not appear on HL",
-				"pos_id", pos.ID, "pair", pos.Pair, "tp", pos.TakeProfit, "err", err)
-		}
-	}
-	if pos.StopLoss > 0 {
-		if err := m.exClient.PlaceTriggerOrder(ctx, pos.Pair, pos.Direction, coinSize, pos.StopLoss, hyperliquid.StopLoss); err != nil {
-			slog.Error("monitor: SL trigger order FAILED — will not appear on HL",
-				"pos_id", pos.ID, "pair", pos.Pair, "sl", pos.StopLoss, "err", err)
-		}
-	}
 }
 
 // ── PnL + TP/SL Helpers ───────────────────────────────────────────────────────

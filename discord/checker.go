@@ -18,6 +18,12 @@ import (
 func (b *Bot) handleCheck(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
 	coin := strings.ToUpper(data.Options[0].StringValue())
+	interval := "4h"
+	for _, opt := range data.Options {
+		if opt.Name == "interval" {
+			interval = opt.StringValue()
+		}
+	}
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
@@ -25,7 +31,7 @@ func (b *Bot) handleCheck(s *discordgo.Session, i *discordgo.InteractionCreate) 
 
 	ctx := context.Background()
 
-	candles, err := b.fetcher.FetchOHLCV(ctx, coin, "4h", 200)
+	candles, err := b.fetcher.FetchOHLCV(ctx, coin, interval, 200)
 	if err != nil {
 		slog.Error("discord: /check fetch OHLCV failed", "coin", coin, "err", err)
 		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{

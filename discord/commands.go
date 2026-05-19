@@ -549,6 +549,14 @@ func (b *Bot) handleCapital(s *discordgo.Session, i *discordgo.InteractionCreate
 // On Accept → execute trade (or acknowledge hold/wait). On Decline → scan continues.
 // If no trade is found after all cycles, shows "No Trade Found".
 func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	data := i.ApplicationCommandData()
+	interval := "4h"
+	for _, opt := range data.Options {
+		if opt.Name == "interval" {
+			interval = opt.StringValue()
+		}
+	}
+
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
@@ -629,7 +637,7 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 				globalSeen[pair] = true
 				totalScanned++
 
-				taResult, mc, err := b.refreshPairData(ctx, pair)
+				taResult, mc, err := b.refreshPairData(ctx, pair, interval)
 				if err != nil {
 					continue
 				}
@@ -1107,6 +1115,13 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 	}
 
 	ctx := context.Background()
+
+	isTrade := sr.score.Action == "open_long" || sr.score.Action == "open_short"
+	if !isTrade {
+		b.respondAck(s, i, fmt.Sprintf("⚠️ AI says \"%s\" — not a trade setup. Wait for a better signal.", sr.score.Action))
+		return
+	}
+
 	var side exchange.OrderSide
 	if sr.score.Action == "open_long" {
 		side = exchange.OrderSideLong
@@ -1128,7 +1143,28 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 		sizeUSD = sr.state.Balance * 0.05
 	}
 
-	orderResult, err := b.exClient.PlaceLimitOrder(ctx, sr.pair, side, sizeUSD, sr.taResult.CurrentPrice, leverage)
+	// Ensure stop loss and take profit exist — use ±3×ATR as fallback
+	stopLoss := sr.score.StopLoss
+	takeProfit := sr.score.TakeProfit
+	if stopLoss <= 0 || takeProfit <= 0 {
+		atrMult := sr.taResult.ATR * 3
+		if side == exchange.OrderSideLong {
+			stopLoss = sr.taResult.CurrentPrice - atrMult
+			takeProfit = sr.taResult.CurrentPrice + atrMult*2
+		} else {
+			stopLoss = sr.taResult.CurrentPrice + atrMult
+			takeProfit = sr.taResult.CurrentPrice - atrMult*2
+		}
+	}
+
+	// v2: atomic bracket order — entry + TP + SL in one call
+	orderResult, err := b.exClient.PlaceBracketOrder(
+		ctx, sr.pair, side, sizeUSD,
+		sr.taResult.CurrentPrice,
+		takeProfit,
+		stopLoss,
+		leverage,
+	)
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseUpdateMessage,
@@ -1144,10 +1180,8 @@ func (b *Bot) handleSuggestExecute(s *discordgo.Session, i *discordgo.Interactio
 		return
 	}
 
-	// TP/SL placed by monitor after position fills — not here
-
 	b.StartMonitor(ctx, sr.pair, side, orderResult.Price, sizeUSD, leverage,
-		sr.score.StopLoss, sr.score.TakeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
+		stopLoss, takeProfit, sr.score.Confidence, sr.score.Strategy, sr.score.Reasoning, orderResult.OrderID)
 
 	// Notify channel
 	b.SendEmbed(&discordgo.MessageEmbed{
@@ -1416,8 +1450,12 @@ func (b *Bot) editSuggestionResult(s *discordgo.Session, i *discordgo.Interactio
 func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
 	coin := strings.ToUpper(data.Options[0].StringValue())
+	interval := "4h"
 	bypass := false
 	for _, opt := range data.Options {
+		if opt.Name == "interval" {
+			interval = opt.StringValue()
+		}
 		if opt.Name == "bypass" {
 			bypass = opt.BoolValue()
 		}
@@ -1430,7 +1468,7 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 	go func() {
 		ctx := context.Background()
 
-		candles, err := b.fetcher.FetchOHLCV(ctx, coin, "4h", 200)
+		candles, err := b.fetcher.FetchOHLCV(ctx, coin, interval, 200)
 		if err != nil {
 			slog.Error("discord: /execute fetch OHLCV failed", "coin", coin, "err", err)
 			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
@@ -1666,8 +1704,8 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 }
 
 // refreshPairData fetches candles, calculates TA, and fetches market context for a pair.
-func (b *Bot) refreshPairData(ctx context.Context, pair string) (ta.TAResult, market.MarketContext, error) {
-	candles, err := b.fetcher.FetchOHLCV(ctx, pair, "4h", 200)
+func (b *Bot) refreshPairData(ctx context.Context, pair, interval string) (ta.TAResult, market.MarketContext, error) {
+	candles, err := b.fetcher.FetchOHLCV(ctx, pair, interval, 200)
 	if err != nil {
 		return ta.TAResult{}, market.MarketContext{}, fmt.Errorf("fetch OHLCV: %w", err)
 	}

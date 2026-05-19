@@ -18,6 +18,7 @@ import (
 	"mambo/journal"
 	"mambo/logger"
 	"mambo/market"
+	"mambo/mcp"
 	"mambo/monitor"
 )
 
@@ -69,8 +70,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// tradingview-mcp — NON-FATAL: if unavailable, /tv uses local TA fallback
+	mcpTACommand := cfg.MCPTACommand
+	mcpTAArgs := []string{"--from", "tradingview-mcp-server", "tradingview-mcp"}
+
+	var mcpTAClient *mcp.Client
+	mcpTAClient, err = mcp.NewClient(mcp.StdioConfig{
+		Command: mcpTACommand,
+		Args:    mcpTAArgs,
+	})
+	if err != nil {
+		slog.Warn("main: tradingview-mcp unavailable, /tv will use local TA fallback",
+			"err", err)
+		mcpTAClient = nil
+	} else {
+		defer mcpTAClient.Close()
+	}
+
 	// create Discord bot first (pass nil monitor, set after)
-	discordBot, err := discord.New(cfg, scorer, fetcher, jl, exClient, nil)
+	discordBot, err := discord.New(cfg, scorer, fetcher, jl, exClient, nil, mcpTAClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "discord error: %v\n", err)
 		os.Exit(1)

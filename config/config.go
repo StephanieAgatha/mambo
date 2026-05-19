@@ -53,7 +53,7 @@ const (
 // Anthropic is handled separately (different API format).
 var providerBaseURLs = map[string]string{
 	ProviderGrok:     "https://api.x.ai/v1",
-	ProviderOpenAI:   "https://api.openai.com/v1",
+	ProviderOpenAI:   "https://ai.sumopod.com/v1",
 	ProviderDeepSeek: "https://hyper.charm.land/v1",
 	// Anthropic uses a different API format — handled in ai/client.go
 	ProviderAnthropic: "https://api.anthropic.com",
@@ -62,7 +62,7 @@ var providerBaseURLs = map[string]string{
 // defaultModels maps provider name → recommended default model.
 var defaultModels = map[string]string{
 	ProviderGrok:      "grok-4.20-0309-reasoning",
-	ProviderOpenAI:    "gpt-4o",
+	ProviderOpenAI:    "gpt-5.4",
 	ProviderDeepSeek:  "deepseek-v4-pro",
 	ProviderAnthropic: "claude-opus-4-5",
 }
@@ -94,11 +94,15 @@ type Config struct {
 	DiscordAuthorizedRoleID string
 
 	// Monitor intervals
-	MonitorPriceSec int // price + hard rules check interval (default 10s)
-	MonitorAISec    int // Grok position analysis interval (default 1200s = 20min)
+	MonitorPriceSec int    // price + hard rules check interval (default 10s)
+	MonitorAISec    int    // Grok position analysis interval (default 1200s = 20min)
+	MonitorAIIntvl  string // timeframe for monitor TA snapshots (default 4h)
 
 	// Feature toggles
 	EnableAI bool // enable/disable AI scoring (default: true)
+
+	// MCP (optional — defaults to uvx)
+	MCPTACommand string // env: MCP_TA_COMMAND, default "uvx"
 }
 
 var PreFilterEnabled bool = true
@@ -235,6 +239,12 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// ── MCP TA command ──────────────────────────────────────────────────────
+	cfg.MCPTACommand = os.Getenv("MCP_TA_COMMAND")
+	if cfg.MCPTACommand == "" {
+		cfg.MCPTACommand = "uvx"
+	}
+
 	// ── Monitor intervals ─────────────────────────────────────────────────────
 
 	cfg.MonitorPriceSec, err = parseInt(os.Getenv("MONITOR_PRICE_SEC"), 10)
@@ -251,6 +261,11 @@ func Load() (*Config, error) {
 	}
 	if cfg.MonitorAISec < 60 {
 		return nil, fmt.Errorf("config: MONITOR_AI_SEC must be ≥ 60 seconds, got %d", cfg.MonitorAISec)
+	}
+
+	cfg.MonitorAIIntvl = os.Getenv("MONITOR_AI_INTERVAL")
+	if cfg.MonitorAIIntvl == "" {
+		cfg.MonitorAIIntvl = "4h"
 	}
 
 	return cfg, nil

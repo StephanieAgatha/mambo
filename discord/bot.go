@@ -12,6 +12,7 @@ import (
 	"mambo/exchange"
 	"mambo/journal"
 	"mambo/market"
+	"mambo/mcp"
 	"mambo/monitor"
 	aiPkg "mambo/ai"
 )
@@ -25,7 +26,8 @@ type Bot struct {
 	jl       *journal.Logger
 	exClient *exchange.Client
 	mon      *monitor.Monitor
-	mode     string // "auto" | "manual"
+	mcpTA    *mcp.Client // tradingview-mcp subprocess; nil = fallback mode
+	mode     string      // "auto" | "manual"
 
 	scanMu        sync.Mutex
 	activeScan    *scanResult // non-nil = waiting for user accept/decline
@@ -55,6 +57,7 @@ func New(
 	jl *journal.Logger,
 	exClient *exchange.Client,
 	mon *monitor.Monitor,
+	mcpTA *mcp.Client,
 ) (*Bot, error) {
 	if cfg.DiscordBotToken == "" {
 		return nil, fmt.Errorf("discord: DISCORD_BOT_TOKEN not set")
@@ -79,6 +82,7 @@ func New(
 		jl:       jl,
 		exClient: exClient,
 		mon:      mon,
+		mcpTA:    mcpTA,
 		mode:     "auto",
 	}
 
@@ -178,6 +182,22 @@ func (b *Bot) registerCommands() error {
 					Type:        discordgo.ApplicationCommandOptionString,
 					Required:    true,
 				},
+				{
+					Name:        "interval",
+					Description: "Timeframe for analysis",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "1m", Value: "1m"},
+						{Name: "5m", Value: "5m"},
+						{Name: "15m", Value: "15m"},
+						{Name: "30m", Value: "30m"},
+						{Name: "1h", Value: "1h"},
+						{Name: "4h", Value: "4h"},
+						{Name: "1d", Value: "1d"},
+						{Name: "1w", Value: "1w"},
+					},
+				},
 			},
 		},
 		{
@@ -236,7 +256,75 @@ func (b *Bot) registerCommands() error {
 		},
 		{
 			Name:        "scan",
-			Description: "Scan the market for a good trade setup",
+			Description: "Scan random pairs with AI and get a setup (pause+confirm flow)",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Name:        "interval",
+					Description: "Timeframe for scanning",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "1m", Value: "1m"},
+						{Name: "5m", Value: "5m"},
+						{Name: "15m", Value: "15m"},
+						{Name: "30m", Value: "30m"},
+						{Name: "1h", Value: "1h"},
+						{Name: "4h", Value: "4h"},
+						{Name: "1d", Value: "1d"},
+						{Name: "1w", Value: "1w"},
+					},
+				},
+			},
+		},
+		{
+			Name:        "tv",
+			Description: "TradingView MCP analysis + AI scoring for a specific coin",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Name:        "coin",
+					Description: "Ticker symbol (e.g. SOL, BTC, ETH)",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    true,
+				},
+				{
+					Name:        "interval",
+					Description: "Timeframe for analysis",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "1m", Value: "1m"},
+						{Name: "5m", Value: "5m"},
+						{Name: "15m", Value: "15m"},
+						{Name: "30m", Value: "30m"},
+						{Name: "1h", Value: "1h"},
+						{Name: "4h", Value: "4h"},
+						{Name: "1d", Value: "1d"},
+						{Name: "1w", Value: "1w"},
+					},
+				},
+			},
+		},
+		{
+			Name:        "hunt",
+			Description: "Auto-scan + execute + monitor — full autonomous trade hunt",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Name:        "interval",
+					Description: "Timeframe for scanning",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "1m", Value: "1m"},
+						{Name: "5m", Value: "5m"},
+						{Name: "15m", Value: "15m"},
+						{Name: "30m", Value: "30m"},
+						{Name: "1h", Value: "1h"},
+						{Name: "4h", Value: "4h"},
+						{Name: "1d", Value: "1d"},
+						{Name: "1w", Value: "1w"},
+					},
+				},
+			},
 		},
 		{
 			Name:        "execute",
@@ -247,6 +335,22 @@ func (b *Bot) registerCommands() error {
 					Description: "Ticker symbol (e.g. SOL, BTC, ETH)",
 					Type:        discordgo.ApplicationCommandOptionString,
 					Required:    true,
+				},
+				{
+					Name:        "interval",
+					Description: "Timeframe for analysis",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "1m", Value: "1m"},
+						{Name: "5m", Value: "5m"},
+						{Name: "15m", Value: "15m"},
+						{Name: "30m", Value: "30m"},
+						{Name: "1h", Value: "1h"},
+						{Name: "4h", Value: "4h"},
+						{Name: "1d", Value: "1d"},
+						{Name: "1w", Value: "1w"},
+					},
 				},
 				{
 					Name:        "bypass",
@@ -282,6 +386,10 @@ func (b *Bot) registerCommands() error {
 			b.handleCapital(s, i)
 		case "pairs":
 			b.handlePairs(s, i)
+		case "tv":
+			b.handleTV(s, i)
+		case "hunt":
+			b.handleHunt(s, i)
 		case "scan":
 			b.handleScan(s, i)
 		case "execute":

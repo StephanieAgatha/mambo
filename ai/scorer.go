@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,13 @@ type ScoreResult struct {
 	ConfluenceCount int
 	RRRatio         float64
 	Reasoning       string
+
+	// ── New in v2 ─────────────────────────────────────────────────────
+	Trend        string // "UPTREND" | "DOWNTREND" | "RANGING"
+	EntryQuality string // "AT_STRUCTURE" | "PULLBACK" | "BREAKOUT" | "CHASE" | "WAIT"
+	SLReasoning  string // structural justification for SL placement
+	TPReasoning  string // structural justification for TP placement
+	Invalidation string // price or action that immediately invalidates the trade
 }
 
 // Scorer sends trade setups to the configured AI provider and parses the response.
@@ -116,6 +124,11 @@ func (s *Scorer) Score(
 		"leverage", result.Leverage,
 		"rr_ratio", result.RRRatio,
 		"strategy", result.Strategy,
+		"trend", result.Trend,
+		"entry_quality", result.EntryQuality,
+		"rsi_div", string(taResult.RSIDivergence),
+		"macd_div", string(taResult.MACDDivergence),
+		"double_div", taResult.DoubleDivergence,
 	)
 
 	return result, nil
@@ -174,6 +187,7 @@ func (s *Scorer) Suggest(
 }
 
 // parseSuggestion extracts the <suggestion> JSON block from AI response.
+// Falls back to <decision> if <suggestion> is not found.
 // Handles markdown code fences that AI might wrap the block in.
 func parseSuggestion(raw, pair string) (ScoreResult, error) {
 	// Strip markdown code fences around the block
@@ -182,20 +196,33 @@ func parseSuggestion(raw, pair string) (ScoreResult, error) {
 
 	re := regexp.MustCompile(`(?s)<suggestion>(.*?)</suggestion>`)
 	matches := re.FindStringSubmatch(cleaned)
-	if len(matches) < 2 {
-		slog.Warn("scorer: no <suggestion> block found — returning fallback",
-			"pair", pair,
-			"raw_len", len(raw),
-		)
-		slog.Debug("scorer: raw AI suggest response", "pair", pair, "raw", raw)
-		return ScoreResult{
-			Symbol:    pair,
-			Action:    "hold",
-			Reasoning: "no suggestion block in AI response",
-		}, nil
+	if len(matches) >= 2 {
+		return parseSuggestBlock(matches[1], pair)
 	}
 
-	jsonStr := strings.TrimSpace(matches[1])
+	// Fallback: AI might have returned <decision> instead of <suggestion>
+	re2 := regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
+	matches2 := re2.FindStringSubmatch(cleaned)
+	if len(matches2) >= 2 {
+		slog.Info("scorer: AI returned <decision> instead of <suggestion> — using as fallback", "pair", pair)
+		return parseDecisionFallback(matches2[1], pair)
+	}
+
+	slog.Warn("scorer: no <suggestion> or <decision> block found — returning fallback",
+		"pair", pair,
+		"raw_len", len(raw),
+	)
+	slog.Debug("scorer: raw AI suggest response", "pair", pair, "raw", raw)
+	return ScoreResult{
+		Symbol:    pair,
+		Action:    "hold",
+		Reasoning: "no suggestion block in AI response",
+	}, nil
+}
+
+// parseSuggestBlock parses a <suggestion> JSON block.
+func parseSuggestBlock(jsonStr, pair string) (ScoreResult, error) {
+	jsonStr = strings.TrimSpace(jsonStr)
 
 	var d struct {
 		Symbol          string  `json:"symbol"`
@@ -210,13 +237,17 @@ func parseSuggestion(raw, pair string) (ScoreResult, error) {
 		ConfluenceCount int     `json:"confluence_count"`
 		RRRatio         float64 `json:"rr_ratio"`
 		Reasoning       string  `json:"reasoning"`
+
+		Trend        string `json:"trend"`
+		EntryQuality string `json:"entry_quality"`
+		SLPlacement  string `json:"sl_placement"`
+		TPPlacement  string `json:"tp_placement"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &d); err != nil {
 		return ScoreResult{}, fmt.Errorf("scorer: unmarshal suggestion JSON: %w", err)
 	}
 
-	// Map the suggestion fields to ScoreResult
 	action := "hold"
 	switch strings.ToUpper(d.Direction) {
 	case "LONG":
@@ -237,23 +268,18 @@ func parseSuggestion(raw, pair string) (ScoreResult, error) {
 		ConfluenceCount: d.ConfluenceCount,
 		RRRatio:         d.RRRatio,
 		Reasoning:       d.Reasoning,
+
+		Trend:        d.Trend,
+		EntryQuality: d.EntryQuality,
+		SLReasoning:  d.SLPlacement,
+		TPReasoning:  d.TPPlacement,
 	}, nil
 }
 
-// parseDecision extracts the <decision> JSON block from AI response.
-func parseDecision(raw, pair string) (ScoreResult, error) {
-	re := regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
-	matches := re.FindStringSubmatch(raw)
-	if len(matches) < 2 {
-		slog.Warn("scorer: no <decision> block found — defaulting to wait", "pair", pair)
-		return ScoreResult{
-			Symbol:    pair,
-			Action:    "wait",
-			Reasoning: "no decision block in AI response",
-		}, nil
-	}
-
-	jsonStr := strings.TrimSpace(matches[1])
+// parseDecisionFallback parses a <decision> block as a suggest fallback.
+// Maps decision fields to ScoreResult fields (action comes from "action" not "direction").
+func parseDecisionFallback(jsonStr, pair string) (ScoreResult, error) {
+	jsonStr = strings.TrimSpace(jsonStr)
 
 	var d struct {
 		Symbol          string  `json:"symbol"`
@@ -267,6 +293,87 @@ func parseDecision(raw, pair string) (ScoreResult, error) {
 		ConfluenceCount int     `json:"confluence_count"`
 		RRRatio         float64 `json:"rr_ratio"`
 		Reasoning       string  `json:"reasoning"`
+
+		Trend        string `json:"trend"`
+		EntryQuality string `json:"entry_quality"`
+		SLReasoning  string `json:"sl_reasoning"`
+		TPReasoning  string `json:"tp_reasoning"`
+		Invalidation string `json:"invalidation"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &d); err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: unmarshal decision fallback JSON: %w", err)
+	}
+
+	return ScoreResult{
+		Symbol:          pair,
+		Action:          d.Action,
+		Leverage:        d.Leverage,
+		PositionSizeUSD: d.PositionSizeUSD,
+		StopLoss:        d.StopLoss,
+		TakeProfit:      d.TakeProfit,
+		Confidence:      d.Confidence,
+		Strategy:        d.Strategy,
+		ConfluenceCount: d.ConfluenceCount,
+		RRRatio:         d.RRRatio,
+		Reasoning:       d.Reasoning,
+
+		Trend:        d.Trend,
+		EntryQuality: d.EntryQuality,
+		SLReasoning:  d.SLReasoning,
+		TPReasoning:  d.TPReasoning,
+		Invalidation: d.Invalidation,
+	}, nil
+}
+
+// parseDecision extracts the <decision> JSON block from AI response.
+// Falls back to raw JSON {…} block if tags are missing.
+func parseDecision(raw, pair string) (ScoreResult, error) {
+	re := regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
+	matches := re.FindStringSubmatch(raw)
+	if len(matches) >= 2 {
+		return parseDecisionJSON(matches[1], pair)
+	}
+
+	// Fallback: AI returned raw JSON without <decision> tags
+	reJSON := regexp.MustCompile(`(?s)\{[^{]*"action"\s*:\s*"[^"]+"[^}]*\}`)
+	matchesJSON := reJSON.FindString(raw)
+	if matchesJSON != "" {
+		slog.Info("scorer: no <decision> tags — found raw JSON block", "pair", pair)
+		return parseDecisionJSON(matchesJSON, pair)
+	}
+
+	slog.Warn("scorer: no <decision> block and no action JSON found — defaulting to wait", "pair", pair)
+	return ScoreResult{
+		Symbol:    pair,
+		Action:    "wait",
+		Reasoning: "no decision block in AI response",
+	}, nil
+}
+
+// parseDecisionJSON unmarshals a JSON decision block into ScoreResult.
+func parseDecisionJSON(jsonStr, pair string) (ScoreResult, error) {
+	jsonStr = strings.TrimSpace(jsonStr)
+
+	var d struct {
+		Symbol          string  `json:"symbol"`
+		Action          string  `json:"action"`
+		Leverage        int     `json:"leverage"`
+		PositionSizeUSD float64 `json:"position_size_usd"`
+		StopLoss        float64 `json:"stop_loss"`
+		TakeProfit      float64 `json:"take_profit"`
+		Confidence      float64 `json:"confidence"`
+		Strategy        string  `json:"strategy"`
+		ConfluenceCount int     `json:"confluence_count"`
+		RRRatio         float64 `json:"rr_ratio"`
+		Reasoning       string  `json:"reasoning"`
+
+		// ── New in v2 ─────────────────────────────────────
+		Trend        string `json:"trend"`
+		EntryQuality string `json:"entry_quality"`
+		SLReasoning  string `json:"sl_reasoning"`
+		TPReasoning  string `json:"tp_reasoning"`
+		Invalidation string `json:"invalidation"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &d); err != nil {
@@ -285,39 +392,48 @@ func parseDecision(raw, pair string) (ScoreResult, error) {
 		ConfluenceCount: d.ConfluenceCount,
 		RRRatio:         d.RRRatio,
 		Reasoning:       d.Reasoning,
+
+		// New
+		Trend:        d.Trend,
+		EntryQuality: d.EntryQuality,
+		SLReasoning:  d.SLReasoning,
+		TPReasoning:  d.TPReasoning,
+		Invalidation: d.Invalidation,
 	}, nil
 }
 
 // validateAndClamp enforces all guardrails on AI output.
 // AI cannot bypass these — they are enforced in Go code.
 func (s *Scorer) validateAndClamp(result ScoreResult, state filter.BotState) ScoreResult {
-	// confidence below minimum → force wait
-	if result.Confidence < config.MinConfidence {
+	isTradeAction := result.Action == "open_long" || result.Action == "open_short"
+
+	// confidence below minimum → force wait (only if AI wanted to trade)
+	if isTradeAction && result.Confidence < config.MinConfidence {
 		slog.Warn("scorer: confidence below minimum — forcing wait",
 			"confidence", result.Confidence,
 			"min", config.MinConfidence,
 			"provider", s.cfg.AIProvider,
 		)
 		result.Action = "wait"
-		result.Reasoning = fmt.Sprintf("confidence %.0f < minimum %d — aborted",
-			result.Confidence, config.MinConfidence)
+		result.Reasoning = fmt.Sprintf("confidence %.0f < minimum %d — aborted. Original: %s",
+			result.Confidence, config.MinConfidence, result.Reasoning)
 		return result
 	}
 
-	// R:R below minimum → force wait
-	if result.RRRatio < config.MinRiskReward {
+	// R:R below minimum → force wait (only if AI wanted to trade)
+	if isTradeAction && result.RRRatio > 0 && result.RRRatio < config.MinRiskReward {
 		slog.Warn("scorer: R:R below minimum — forcing wait",
 			"rr_ratio", result.RRRatio,
 			"min", config.MinRiskReward,
 		)
 		result.Action = "wait"
-		result.Reasoning = fmt.Sprintf("R:R %.2f < minimum %.1f — aborted",
-			result.RRRatio, config.MinRiskReward)
+		result.Reasoning = fmt.Sprintf("R:R %.2f < minimum %.1f — aborted. Original: %s",
+			result.RRRatio, config.MinRiskReward, result.Reasoning)
 		return result
 	}
 
 	// non-trade actions don't need size/leverage clamping
-	if result.Action == "wait" || result.Action == "hold" {
+	if !isTradeAction {
 		return result
 	}
 
@@ -411,7 +527,9 @@ func (s *Scorer) fillTemplate(
 		// RSI
 		"{{RSI_VALUE}}", fmt.Sprintf("%.2f", r.RSI),
 		"{{RSI_ZONE}}", r.RSIZone,
-		"{{RSI_DIVERGENCE}}", r.RSIDivergence,
+		"{{RSI_DIVERGENCE}}", boolToStr(r.RSIDivergence != ta.DivNone),
+		"{{RSI_DIV_TYPE}}", string(r.RSIDivergence),
+		"{{RSI_DIV_BARS}}", strconv.Itoa(r.RSIDivBarsAgo),
 
 		// ATR
 		"{{ATR_VALUE}}", fmt.Sprintf("%.4f", r.ATR),
@@ -425,7 +543,9 @@ func (s *Scorer) fillTemplate(
 		"{{MACD_SIGNAL_VALUE}}", fmt.Sprintf("%.4f", r.MACDSignal),
 		"{{MACD_HISTOGRAM}}", fmt.Sprintf("%.4f", r.MACDHistogram),
 		"{{MACD_CROSS}}", r.MACDCross,
-		"{{MACD_DIVERGENCE}}", r.MACDDivergence,
+		"{{MACD_DIVERGENCE}}", boolToStr(r.MACDDivergence != ta.DivNone),
+		"{{MACD_DIV_TYPE}}", string(r.MACDDivergence),
+		"{{MACD_DIV_BARS}}", strconv.Itoa(r.MACDDivBarsAgo),
 
 		// Bollinger Bands
 		"{{BB_UPPER}}", fmt.Sprintf("%.4f", r.BBUpper),
@@ -481,6 +601,8 @@ func (s *Scorer) fillTemplate(
 		"{{MARKET_SIGNAL}}", "see market context",
 		"{{RISK_STATUS}}", "passed pre-filter",
 		"{{RR_GATE}}", "AI will evaluate",
+		"{{SR_ENTRY_SIGNAL}}", srEntrySignal(r),
+		"{{DIVERGENCE_SIGNAL}}", divergenceSignalStr(r),
 		"{{TIMESTAMP}}", time.Now().Format(time.RFC3339),
 	)
 
@@ -493,4 +615,34 @@ func trendGate(spread float64) string {
 		return "PASS"
 	}
 	return "SKIP (sideways market)"
+}
+
+// divergenceSignalStr returns the confluence table value for the divergence row.
+func divergenceSignalStr(r ta.TAResult) string {
+	if r.DoubleDivergence {
+		return "DOUBLE_CONFIRMED ⚡"
+	}
+	if r.RSIDivergence != ta.DivNone || r.MACDDivergence != ta.DivNone {
+		return "DETECTED"
+	}
+	return "NEUTRAL"
+}
+
+// srEntrySignal returns the confluence table value for the S/R entry row.
+func srEntrySignal(r ta.TAResult) string {
+	if r.AtSupport {
+		return "AT_SUPPORT ✅"
+	}
+	if r.NearResistance {
+		return "NEAR_RESISTANCE ⚠️"
+	}
+	return "BETWEEN_LEVELS"
+}
+
+// boolToStr converts bool to "true"/"false" string for template placeholders.
+func boolToStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }

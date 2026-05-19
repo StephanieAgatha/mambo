@@ -35,7 +35,9 @@ type TAResult struct {
 	// RSI
 	RSI           float64
 	RSIZone       string // "overbought >70" / "oversold <30" / "valid 40-60" / "valid 30-70"
-	RSIDivergence string // "bullish" / "hidden_bullish" / "bearish" / "none"
+	// RSI divergence — typed, replaces old RSIDivergence string
+	RSIDivergence  DivergenceType // "none" | "regular_bullish" | "regular_bearish" | "hidden_bullish" | "hidden_bearish"
+	RSIDivBarsAgo  int            // 0 = not detected
 
 	// ATR — used for dynamic SL calculation
 	ATR      float64
@@ -44,11 +46,18 @@ type TAResult struct {
 	SL15ATR  float64 // entry - (1.5 × ATR)
 
 	// MACD (12, 26, 9)
-	MACDValue      float64
-	MACDSignal     float64
-	MACDHistogram  float64
-	MACDCross      string // "bullish cross" / "bearish cross" / "none"
-	MACDDivergence string // "bullish" / "bearish" / "none"
+	MACDValue     float64
+	MACDSignal    float64
+	MACDHistogram float64
+	MACDCross     string // "bullish cross" / "bearish cross" / "none"
+
+	// MACD histogram divergence — typed, replaces old MACDDivergence string
+	MACDDivergence DivergenceType
+	MACDDivBarsAgo int
+
+	// DoubleDivergence is true when RSI and MACD show the same divergence type
+	DoubleDivergence     bool
+	DoubleDivergenceType DivergenceType
 
 	// Bollinger Bands (20, 2)
 	BBUpper    float64
@@ -113,8 +122,6 @@ func Calculate(bars []market.OHLCV) (TAResult, error) {
 	rsi := techan.NewRelativeStrengthIndexIndicator(closePrice, 14)
 	result.RSI = rsi.Calculate(lastIdx).Float()
 	result.RSIZone = rsiZone(result.RSI)
-	result.RSIDivergence = detectRSIDivergence(closePrice, rsi, lastIdx, 5)
-
 	// ── ATR (14) ──────────────────────────────────────────────────────────────
 	atr := techan.NewAverageTrueRangeIndicator(series, 14)
 	result.ATR = atr.Calculate(lastIdx).Float()
@@ -134,8 +141,6 @@ func Calculate(bars []market.OHLCV) (TAResult, error) {
 	result.MACDSignal = macdSignal.Calculate(lastIdx).Float()
 	result.MACDHistogram = macdHist.Calculate(lastIdx).Float()
 	result.MACDCross = macdCross(macdLine, macdSignal, lastIdx)
-	result.MACDDivergence = detectMACDDivergence(closePrice, macdHist, lastIdx, 5)
-
 	// ── Bollinger Bands (20, 2) ───────────────────────────────────────────────
 	// techan API: NewBollinger{Upper,Lower}BandIndicator(indicator, window, sigma)
 	bbUpper := techan.NewBollingerUpperBandIndicator(closePrice, 20, 2.0)
@@ -171,6 +176,33 @@ func Calculate(bars []market.OHLCV) (TAResult, error) {
 	result.ResistanceStrength = srResult.resistanceStrength
 	result.AtSupport = srResult.atSupport
 	result.NearResistance = srResult.nearResistance
+
+	// ── Divergence Detection (RSI + MACD) ─────────────────────────────────────
+	n := lastIdx + 1
+
+	rsiSeries := extractFloatSeries(rsi, n)
+	macdHistSeries := extractFloatSeries(macdHist, n)
+
+	closes := make([]float64, len(bars))
+	highs := make([]float64, len(bars))
+	lows := make([]float64, len(bars))
+	for i, bar := range bars {
+		closes[i] = bar.Close
+		highs[i] = bar.High
+		lows[i] = bar.Low
+	}
+
+	rsiDiv, macdDiv := DetectDivergence(closes, highs, lows, rsiSeries, macdHistSeries, DivLookbackBars)
+
+	result.RSIDivergence = rsiDiv.Type
+	result.RSIDivBarsAgo = rsiDiv.BarsAgo
+	result.MACDDivergence = macdDiv.Type
+	result.MACDDivBarsAgo = macdDiv.BarsAgo
+
+	if rsiDiv.Type != DivNone && rsiDiv.Type == macdDiv.Type {
+		result.DoubleDivergence = true
+		result.DoubleDivergenceType = rsiDiv.Type
+	}
 
 	slog.Debug("TA calculated",
 		"price", result.CurrentPrice,
@@ -519,47 +551,11 @@ func macdCross(macdLine, macdSignal techan.Indicator, lastIdx int) string {
 	}
 }
 
-func detectRSIDivergence(price, rsi techan.Indicator, lastIdx, lookback int) string {
-	if lastIdx < lookback {
-		return "none"
+// extractFloatSeries extracts a []float64 from a techan indicator over n bars.
+func extractFloatSeries(ind techan.Indicator, n int) []float64 {
+	series := make([]float64, n)
+	for i := 0; i < n; i++ {
+		series[i] = ind.Calculate(i).Float()
 	}
-	prevIdx := lastIdx - lookback
-	prevPrice := price.Calculate(prevIdx).Float()
-	currPrice := price.Calculate(lastIdx).Float()
-	prevRSI := rsi.Calculate(prevIdx).Float()
-	currRSI := rsi.Calculate(lastIdx).Float()
-
-	switch {
-	// Bullish divergence: price makes lower low, RSI makes higher low
-	case currPrice < prevPrice && currRSI > prevRSI:
-		return "bullish"
-	// Bearish divergence: price makes higher high, RSI makes lower high (RSI > 50 zone)
-	case currPrice > prevPrice && currRSI < prevRSI && currRSI >= 50:
-		return "bearish"
-	// Hidden bullish divergence: price makes higher low, RSI makes lower low (RSI < 50 zone)
-	case currPrice > prevPrice && currRSI < prevRSI && currRSI < 50:
-		return "hidden_bullish"
-	default:
-		return "none"
-	}
-}
-
-func detectMACDDivergence(price, macdHist techan.Indicator, lastIdx, lookback int) string {
-	if lastIdx < lookback {
-		return "none"
-	}
-	prevIdx := lastIdx - lookback
-	prevPrice := price.Calculate(prevIdx).Float()
-	currPrice := price.Calculate(lastIdx).Float()
-	prevHist := macdHist.Calculate(prevIdx).Float()
-	currHist := macdHist.Calculate(lastIdx).Float()
-
-	switch {
-	case currPrice < prevPrice && currHist > prevHist:
-		return "bullish"
-	case currPrice > prevPrice && currHist < prevHist:
-		return "bearish"
-	default:
-		return "none"
-	}
+	return series
 }

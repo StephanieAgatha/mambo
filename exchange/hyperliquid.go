@@ -343,7 +343,7 @@ func (c *Client) PlaceTriggerOrder(
 		Coin:       pair,
 		IsBuy:      isBuy,
 		Size:       coinSize,
-		Price:      0,
+		Price:      triggerPrice,
 		ReduceOnly: true,
 		OrderType: hyperliquid.OrderType{
 			Trigger: &hyperliquid.TriggerOrderType{
@@ -359,29 +359,33 @@ func (c *Client) PlaceTriggerOrder(
 		return fmt.Errorf("exchange: place %s trigger failed pair=%s px=%.4f: %w", tpsl, pair, triggerPrice, err)
 	}
 
+	// Check for error in the status response
 	if resp.Error != nil {
-		return fmt.Errorf("exchange: place %s trigger rejected pair=%s: %s", tpsl, pair, *resp.Error)
+		return fmt.Errorf("exchange: place %s trigger rejected by HL pair=%s: %s", tpsl, pair, *resp.Error)
 	}
 
 	var orderID int64
 	if resp.Resting != nil {
 		orderID = resp.Resting.Oid
+		slog.Info("trigger order placed (resting)",
+			"pair", pair,
+			"tpsl", tpsl,
+			"trigger_px", triggerPrice,
+			"size_coins", coinSize,
+			"order_id", orderID,
+			"network", c.cfg.NetworkLabel(),
+		)
 	} else if resp.Filled != nil {
 		orderID = int64(resp.Filled.Oid)
+		slog.Info("trigger order placed (filled immediately)",
+			"pair", pair,
+			"tpsl", tpsl,
+			"trigger_px", triggerPrice,
+			"order_id", orderID,
+		)
+	} else {
+		return fmt.Errorf("exchange: place %s trigger returned neither resting nor filled pair=%s — HL likely rejected silently", tpsl, pair)
 	}
-
-	if orderID == 0 {
-		return fmt.Errorf("exchange: place %s trigger returned no order ID pair=%s — order may have been silently rejected", tpsl, pair)
-	}
-
-	slog.Info("trigger order placed",
-		"pair", pair,
-		"tpsl", tpsl,
-		"trigger_px", triggerPrice,
-		"size_coins", coinSize,
-		"order_id", orderID,
-		"network", c.cfg.NetworkLabel(),
-	)
 
 	return nil
 }
@@ -485,6 +489,111 @@ func (c *Client) FetchDailyPnL(ctx context.Context) (lossUSD float64, winUSD flo
 	}
 
 	return lossUSD, winUSD, consecLosses, nil
+}
+
+// PlaceBracketOrder places entry + TP + SL atomically in one call.
+// Uses BulkOrders to submit all 3 orders together — Hyperliquid activates TP/SL once entry fills.
+// This replaces the old PlaceLimitOrder + waitForFill + PlaceTriggerOrder pattern.
+// Deprecated: PlaceLimitOrder + PlaceTriggerOrder remain for backward compatibility.
+func (c *Client) PlaceBracketOrder(
+	ctx context.Context,
+	pair string,
+	side OrderSide,
+	sizeUSD float64,
+	entryPrice float64,
+	takeProfitPrice float64,
+	stopLossPrice float64,
+	leverage int,
+) (OrderResult, error) {
+	// Set cross margin leverage before placing orders
+	if _, err := c.ex.UpdateLeverage(ctx, leverage, pair, true); err != nil {
+		return OrderResult{}, fmt.Errorf("exchange: set leverage %dx failed pair=%s: %w", leverage, pair, err)
+	}
+
+	isBuy := side == OrderSideLong
+
+	// Round size to pair's szDecimals — same logic as PlaceLimitOrder
+	decimals := c.szDecimalsForPair(ctx, pair)
+	roundFactor := math.Pow(10, float64(decimals))
+	sizeCoins := math.Round((sizeUSD/entryPrice)*roundFactor) / roundFactor
+
+	orders := []hyperliquid.CreateOrderRequest{
+		// (A) Entry — limit GTC, opens position
+		{
+			Coin:       pair,
+			IsBuy:      isBuy,
+			Size:       sizeCoins,
+			Price:      entryPrice,
+			ReduceOnly: false,
+			OrderType:  hyperliquid.OrderType{Limit: &hyperliquid.LimitOrderType{Tif: "Gtc"}},
+		},
+		// (B) Stop-loss — trigger market, reduce-only, opposite side
+		{
+			Coin:       pair,
+			IsBuy:      !isBuy,
+			Size:       sizeCoins,
+			Price:      0, // ignored when IsMarket: true
+			ReduceOnly: true,
+			OrderType: hyperliquid.OrderType{
+				Trigger: &hyperliquid.TriggerOrderType{
+					TriggerPx: stopLossPrice,
+					IsMarket:  true,
+					Tpsl:      hyperliquid.StopLoss,
+				},
+			},
+		},
+		// (C) Take-profit — trigger market, reduce-only, opposite side
+		{
+			Coin:       pair,
+			IsBuy:      !isBuy,
+			Size:       sizeCoins,
+			Price:      0,
+			ReduceOnly: true,
+			OrderType: hyperliquid.OrderType{
+				Trigger: &hyperliquid.TriggerOrderType{
+					TriggerPx: takeProfitPrice,
+					IsMarket:  true,
+					Tpsl:      hyperliquid.TakeProfit,
+				},
+			},
+		},
+	}
+
+	resp, err := c.ex.BulkOrders(ctx, orders, nil)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("exchange: bracket order failed pair=%s: %w", pair, err)
+	}
+
+	// Entry order ID is the first response
+	var orderID uint64
+	if resp != nil && resp.Data.Statuses != nil && len(resp.Data.Statuses) > 0 {
+		if resp.Data.Statuses[0].Resting != nil {
+			orderID = uint64(resp.Data.Statuses[0].Resting.Oid)
+		}
+	}
+
+	slog.Info("bracket order placed",
+		"pair", pair,
+		"side", side,
+		"entry_px", entryPrice,
+		"tp_px", takeProfitPrice,
+		"sl_px", stopLossPrice,
+		"size_coins", sizeCoins,
+		"size_usd", sizeUSD,
+		"leverage", leverage,
+		"entry_order_id", orderID,
+		"network", c.cfg.NetworkLabel(),
+	)
+
+	return OrderResult{
+		OrderID:  orderID,
+		Pair:     pair,
+		Side:     side,
+		Price:    entryPrice,
+		SizeUSD:  sizeUSD,
+		Leverage: leverage,
+		PlacedAt: time.Now(),
+	}, nil
 }
 
 // ClosePosition closes an open position using a reduce-only market order.

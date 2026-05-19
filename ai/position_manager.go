@@ -138,6 +138,9 @@ LIVE TA SNAPSHOT:
 - Resistance       : $%.4f (%s)
 - At support       : %v
 - Near resistance  : %v
+- RSI Divergence   : %s (%d bars ago)
+- MACD Divergence  : %s (%d bars ago)
+- Double Divergence: %v
 
 DECISION RULES:
 - Never move SL below entry (long) or above entry (short)
@@ -147,6 +150,11 @@ DECISION RULES:
 - Price approaching strong resistance + PnL > 3%% → consider closing or moving TP down
 - Price bouncing off support again → hold, can tighten SL above support
 - If in noise zone (-1.5%% to +1.5%%) → hold unless very high confidence
+- Hidden bullish divergence + long in drawdown → hold, momentum likely recovering
+- Hidden bearish divergence + short in drawdown → hold, momentum likely recovering
+- Regular bearish divergence + long near TP + PnL > 3%% → close early, momentum fading
+- Regular bullish divergence + short near TP + PnL > 3%% → close early, momentum fading
+- Double divergence (RSI + MACD agree) → weight this signal heavily in your decision
 
 Respond ONLY in this exact format:
 <decision>
@@ -170,6 +178,9 @@ Respond ONLY in this exact format:
 		snap.NearestSupport, snap.SupportStrength,
 		snap.NearestResistance, snap.ResistanceStrength,
 		snap.AtSupport, snap.NearResistance,
+		string(snap.RSIDivergence), snap.RSIDivBarsAgo,
+		string(snap.MACDDivergence), snap.MACDDivBarsAgo,
+		snap.DoubleDivergence,
 	)
 }
 
