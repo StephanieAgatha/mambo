@@ -94,8 +94,11 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			// ── Phase 1: Batch pre-screen via Altfins ───────────────────────
 			sample := pickRandomSample(prescreenBatchSize, globalSeen)
 			if len(sample) == 0 {
-				slog.Info("hunt: no new pairs to sample")
-				break
+				// all pairs exhausted — reset and start fresh next cycle
+				slog.Info("hunt: all pairs seen, resetting for re-scan")
+				globalSeen = make(map[string]bool)
+				time.Sleep(retryDelay)
+				continue
 			}
 			for _, p := range sample {
 				globalSeen[p] = true
