@@ -1,3 +1,58 @@
 {
-    "trades": []
+  "trades": [
+    {
+      "id": "pos_1778410857499",
+      "pair": "HYPE",
+      "direction": "short",
+      "entry_price": 28.52,
+      "exit_price": 26.525,
+      "size_usd": 86.79,
+      "leverage": 5,
+      "pnl_usd": 6.071039621318377,
+      "pnl_pct": 6.995091164095375,
+      "result": "WIN",
+      "close_reason": "HARD_RULE_TIMEOUT",
+      "strategy": "bypass",
+      "confidence": 0,
+      "ai_reason": "direct execution",
+      "opened_at": "2026-05-10T18:00:57+07:00",
+      "closed_at": "2026-05-13T13:58:33+07:00"
+    },
+    {
+      "id": "pos_1778659584744",
+      "pair": "JTO",
+      "direction": "long",
+      "entry_price": 0.48181,
+      "exit_price": 0.51719,
+      "size_usd": 118.87,
+      "leverage": 4,
+      "pnl_usd": 8.728794753118454,
+      "pnl_pct": 7.3431435628152215,
+      "result": "WIN",
+      "close_reason": "TAKE_PROFIT",
+      "strategy": "BB Lower Band + Support Bounce",
+      "confidence": 55,
+      "ai_reason": "Price at BB lower band and weak support in macro uptrend, but bearish MACD/OBV limit confidence. Sized up due to support.",
+      "opened_at": "2026-05-13T15:06:24+07:00",
+      "closed_at": "2026-05-13T15:21:00+07:00"
+    },
+    {
+      "id": "pos_1778665756821",
+      "pair": "WLFI",
+      "direction": "long",
+      "entry_price": 0.068119,
+      "exit_price": 0.067028,
+      "size_usd": 42.58,
+      "leverage": 1,
+      "pnl_usd": -0.6819650905033805,
+      "pnl_pct": -1.6016089490450458,
+      "result": "LOSS",
+      "close_reason": "STOP_LOSS",
+      "strategy": "Breakout above resistance with trend gate pass",
+      "confidence": 35,
+      "ai_reason": "EMA spread 0.405% pass indicates a trending market, but the ribbon is mixed (EMA9 \u003c EMA21) and daily death cross prevails. RSI neutral, MACD histogram slightly positive but no cross, volume low with falling OBV — overall very weak bullish evidence. Price is at strong resistance ($0.0682) and ATR is low, so a tight stop at 1.5×ATR ($0.0671) yields a small risk ($0.0010). For 2:1 R:R we target $0.0701, which would require a clear break above resistance. The prefilter likely flagged this due to low confluence and proximity to resistance; I still see a minimal opportunity if a breakout materialises, but confidence is low (35%). Size limited to 5% of balance ($42.58) with 1x leverage to cap risk. DYOR.",
+      "opened_at": "2026-05-13T16:49:16+07:00",
+      "closed_at": "2026-05-13T17:39:26+07:00"
+    }
+  ]
 }

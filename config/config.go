@@ -39,6 +39,7 @@ const (
 	// Free market context APIs
 	FearGreedURL  = "https://api.alternative.me/fng/?limit=1"
 	BinanceFutURL = "https://fapi.binance.com"
+	AltfinsAPIURL = "https://altfins.com/api/v2/public/ohlcv/snapshot-requests"
 )
 
 // Supported AI providers
@@ -103,6 +104,9 @@ type Config struct {
 
 	// MCP (optional — defaults to uvx)
 	MCPTACommand string // env: MCP_TA_COMMAND, default "uvx"
+
+	// Altfins verification (optional)
+	AltfinsAPIKey string // env: ALTFINS_API_KEY
 }
 
 var PreFilterEnabled bool = true
@@ -244,6 +248,9 @@ func Load() (*Config, error) {
 	if cfg.MCPTACommand == "" {
 		cfg.MCPTACommand = "uvx"
 	}
+
+	// ── Altfins verification (optional) ────────────────────────────────────
+	cfg.AltfinsAPIKey = os.Getenv("ALTFINS_API_KEY")
 
 	// ── Monitor intervals ─────────────────────────────────────────────────────
 

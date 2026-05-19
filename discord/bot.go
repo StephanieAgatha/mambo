@@ -327,6 +327,30 @@ func (b *Bot) registerCommands() error {
 			},
 		},
 		{
+			Name:        "verify",
+			Description: "Compare OHLCV candle from Hyperliquid vs Altfins",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Name:        "coin",
+					Description: "Ticker symbol (e.g. SOL, BTC, ETH)",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    true,
+				},
+				{
+					Name:        "interval",
+					Description: "Timeframe (Altfins: DAILY/HOURLY/WEEKLY/MONTHLY)",
+					Type:        discordgo.ApplicationCommandOptionString,
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "HOURLY", Value: "HOURLY"},
+						{Name: "DAILY", Value: "DAILY"},
+						{Name: "WEEKLY", Value: "WEEKLY"},
+						{Name: "MONTHLY", Value: "MONTHLY"},
+					},
+				},
+			},
+		},
+		{
 			Name:        "execute",
 			Description: "Execute a trade — with or without AI analysis",
 			Options: []*discordgo.ApplicationCommandOption{
@@ -394,6 +418,8 @@ func (b *Bot) registerCommands() error {
 			b.handleScan(s, i)
 		case "execute":
 			b.handleExecute(s, i)
+		case "verify":
+			b.handleVerify(s, i)
 		}
 	})
 

@@ -1,6 +1,7 @@
 package market
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,12 +10,49 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	hyperliquid "github.com/sonirico/go-hyperliquid"
 
 	"mambo/config"
 )
+
+// AltfinsOHLCV holds a single candle from the Altfins snapshot API.
+// Altfins sometimes returns numeric fields as strings — FlexFloat handles both.
+type AltfinsOHLCV struct {
+	Symbol string    `json:"symbol"`
+	Time   string    `json:"time"`
+	Open   FlexFloat `json:"open"`
+	High   FlexFloat `json:"high"`
+	Low    FlexFloat `json:"low"`
+	Close  FlexFloat `json:"close"`
+	Volume FlexFloat `json:"volume"`
+}
+
+// FlexFloat unmarshals both JSON numbers and numeric strings into float64.
+type FlexFloat float64
+
+func (f *FlexFloat) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return fmt.Errorf("flexfloat: parse %q: %w", s, err)
+		}
+		*f = FlexFloat(v)
+		return nil
+	}
+	var n float64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("flexfloat: %w", err)
+	}
+	*f = FlexFloat(n)
+	return nil
+}
+
+// AltfinsResponse is the raw API response array.
+type AltfinsResponse []AltfinsOHLCV
 
 // OHLCV represents a single candlestick bar.
 // Named OHLCV (not Candle) to avoid conflict with the SDK's hyperliquid.Candle type.
@@ -363,6 +401,71 @@ func (f *Fetcher) FetchMarketContext(ctx context.Context, pair string) (MarketCo
 	}
 
 	return mc, nil
+}
+
+// FetchAltfinsSnapshot fetches the latest OHLCV candle from Altfins for comparison.
+// timeInterval: "DAILY" | "HOURLY" | "WEEKLY" | "MONTHLY"
+// Requires ALTFINS_API_KEY in config.
+func (f *Fetcher) FetchAltfinsSnapshot(ctx context.Context, coin, timeInterval string) (AltfinsOHLCV, error) {
+	if f.cfg.AltfinsAPIKey == "" {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: ALTFINS_API_KEY not configured")
+	}
+
+	body := map[string]any{
+		"symbols":      []string{strings.ToUpper(coin)},
+		"timeInterval": timeInterval,
+	}
+
+	b, err := json.Marshal(body)
+	if err != nil {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: marshal altfins request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, config.AltfinsAPIURL, bytes.NewReader(b))
+	if err != nil {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: build altfins request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-API-KEY", f.cfg.AltfinsAPIKey)
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: altfins request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: read altfins response: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		limit := min(500, len(raw))
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: altfins returned %d: %s", resp.StatusCode, string(raw[:limit]))
+	}
+
+	var result AltfinsResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: parse altfins response: %w", err)
+	}
+
+	if len(result) == 0 {
+		return AltfinsOHLCV{}, fmt.Errorf("fetcher: altfins returned empty array for %s/%s", coin, timeInterval)
+	}
+
+	entry := result[0]
+	slog.Debug("altfins snapshot fetched",
+		"coin", coin,
+		"interval", timeInterval,
+		"open", entry.Open,
+		"high", entry.High,
+		"low", entry.Low,
+		"close", entry.Close,
+		"volume", entry.Volume,
+	)
+
+	return entry, nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
