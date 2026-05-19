@@ -21,7 +21,8 @@ import (
 // ScoreResult holds the parsed AI decision for a trade setup.
 type ScoreResult struct {
 	Symbol          string
-	Action          string // "open_long" / "open_short" / "hold" / "wait"
+	Action          string  // "open_long" / "open_short" / "hold" / "wait"
+	Direction       string  // "long" / "short" — used by /execute flow
 	Leverage        int
 	PositionSizeUSD float64
 	StopLoss        float64
@@ -42,11 +43,12 @@ type ScoreResult struct {
 
 // Scorer sends trade setups to the configured AI provider and parses the response.
 type Scorer struct {
-	agentPrompt  string
-	template     string
+	agentPrompt   string
+	template      string
 	suggestPrompt string
-	client       *Client
-	cfg          *config.Config
+	executePrompt string
+	client        *Client
+	cfg           *config.Config
 }
 
 // NewScorer loads AGENT.md and verify_trade.md once at startup.
@@ -66,6 +68,11 @@ func NewScorer(cfg *config.Config) (*Scorer, error) {
 		return nil, fmt.Errorf("scorer: read prompts/suggest_trade.md: %w", err)
 	}
 
+	executePrompt, err := os.ReadFile("prompts/execute_trade.md")
+	if err != nil {
+		return nil, fmt.Errorf("scorer: read prompts/execute_trade.md: %w", err)
+	}
+
 	// reasoning models can take longer — generous timeout
 	client := NewClient(cfg, 120*time.Second)
 
@@ -80,6 +87,7 @@ func NewScorer(cfg *config.Config) (*Scorer, error) {
 		agentPrompt:   string(agentPrompt),
 		template:      string(template),
 		suggestPrompt: string(suggestPrompt),
+		executePrompt: string(executePrompt),
 		client:        client,
 		cfg:           cfg,
 	}, nil
@@ -181,6 +189,68 @@ func (s *Scorer) Suggest(
 		"leverage", result.Leverage,
 		"rr_ratio", result.RRRatio,
 		"strategy", result.Strategy,
+	)
+
+	return result, nil
+}
+
+// Execute runs the direct execution prompt — forces a directional decision (long/short).
+// No "wait" or "hold" fallback. Always returns a trade with direction, TP, SL, and sizing.
+func (s *Scorer) Execute(
+	ctx context.Context,
+	pair string,
+	taResult ta.TAResult,
+	mc market.MarketContext,
+	state filter.BotState,
+) (ScoreResult, error) {
+	prompt := s.fillTemplate(pair, taResult, mc, state)
+
+	slog.Debug("sending execute request to AI",
+		"provider", s.cfg.AIProvider,
+		"model", s.cfg.AIModel,
+		"pair", pair,
+	)
+
+	raw, err := s.client.Chat(ctx, s.executePrompt, prompt)
+	if err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: AI execute call failed pair=%s: %w", pair, err)
+	}
+
+	// Log raw response
+	slog.Info("scorer: AI execute raw response",
+		"pair", pair,
+		"raw_len", len(raw),
+		"raw_preview", raw[:min(len(raw), 500)],
+	)
+
+	result, err := parseExecute(raw, pair)
+	if err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: parse execute failed pair=%s: %w", pair, err)
+	}
+
+	result = s.validateAndClamp(result, state)
+
+	// Ensure direction is always set
+	if result.Direction == "" {
+		if result.Action == "open_long" {
+			result.Direction = "long"
+		} else if result.Action == "open_short" {
+			result.Direction = "short"
+		} else {
+			result.Direction = "long" // default to long as last resort
+		}
+	}
+
+	slog.Info("AI execute complete",
+		"provider", s.cfg.AIProvider,
+		"pair", pair,
+		"direction", result.Direction,
+		"confidence", result.Confidence,
+		"size_usd", result.PositionSizeUSD,
+		"leverage", result.Leverage,
+		"rr_ratio", result.RRRatio,
+		"strategy", result.Strategy,
+		"entry_quality", result.EntryQuality,
 	)
 
 	return result, nil
@@ -645,4 +715,109 @@ func boolToStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// parseExecute extracts the <decision> JSON block from an execute AI response.
+// Same format as parseDecisionJSON but also maps direction.
+func parseExecute(raw, pair string) (ScoreResult, error) {
+	// Strip markdown code fences
+	cleaned := strings.ReplaceAll(raw, "```json", "")
+	cleaned = strings.ReplaceAll(cleaned, "```", "")
+
+	re := regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
+	matches := re.FindStringSubmatch(cleaned)
+	if len(matches) >= 2 {
+		jsonStr := strings.TrimSpace(matches[1])
+		return parseExecuteJSON(jsonStr, pair)
+	}
+
+	// Fallback: raw JSON without <decision> tags
+	reJSON := regexp.MustCompile(`(?s)\{[^{]*"(?:direction|action)"\s*:\s*"[^"]+"[^}]*\}`)
+	matchesJSON := reJSON.FindString(cleaned)
+	if matchesJSON != "" {
+		slog.Info("scorer: execute response has no <decision> tags — using raw JSON", "pair", pair)
+		return parseExecuteJSON(matchesJSON, pair)
+	}
+
+	slog.Warn("scorer: no <decision> block in execute response — defaulting long", "pair", pair)
+	return ScoreResult{
+		Symbol:    pair,
+		Action:    "open_long",
+		Direction: "long",
+		Reasoning: "no decision block in AI response, defaulted to long",
+	}, nil
+}
+
+// parseExecuteJSON unmarshals a JSON decision block with direction field.
+func parseExecuteJSON(jsonStr, pair string) (ScoreResult, error) {
+	jsonStr = strings.TrimSpace(jsonStr)
+
+	var d struct {
+		Symbol          string  `json:"symbol"`
+		Action          string  `json:"action"`
+		Direction       string  `json:"direction"`
+		Leverage        int     `json:"leverage"`
+		PositionSizeUSD float64 `json:"position_size_usd"`
+		EntryPrice      float64 `json:"entry_price"`
+		StopLoss        float64 `json:"stop_loss"`
+		TakeProfit      float64 `json:"take_profit"`
+		Confidence      float64 `json:"confidence"`
+		Strategy        string  `json:"strategy"`
+		ConfluenceCount int     `json:"confluence_count"`
+		RRRatio         float64 `json:"rr_ratio"`
+		Reasoning       string  `json:"reasoning"`
+
+		Trend        string `json:"trend"`
+		EntryQuality string `json:"entry_quality"`
+		SLReasoning  string `json:"sl_reasoning"`
+		TPReasoning  string `json:"tp_reasoning"`
+		Invalidation string `json:"invalidation"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &d); err != nil {
+		return ScoreResult{}, fmt.Errorf("scorer: unmarshal execute JSON: %w", err)
+	}
+
+	// Map direction to action
+	action := d.Action
+	if d.Action == "" {
+		switch strings.ToLower(d.Direction) {
+		case "long":
+			action = "open_long"
+		case "short":
+			action = "open_short"
+		default:
+			action = "open_long"
+		}
+	}
+
+	direction := strings.ToLower(d.Direction)
+	if direction == "" {
+		if action == "open_short" {
+			direction = "short"
+		} else {
+			direction = "long"
+		}
+	}
+
+	return ScoreResult{
+		Symbol:          pair,
+		Action:          action,
+		Direction:       direction,
+		Leverage:        d.Leverage,
+		PositionSizeUSD: d.PositionSizeUSD,
+		StopLoss:        d.StopLoss,
+		TakeProfit:      d.TakeProfit,
+		Confidence:      d.Confidence,
+		Strategy:        d.Strategy,
+		ConfluenceCount: d.ConfluenceCount,
+		RRRatio:         d.RRRatio,
+		Reasoning:       d.Reasoning,
+
+		Trend:        d.Trend,
+		EntryQuality: d.EntryQuality,
+		SLReasoning:  d.SLReasoning,
+		TPReasoning:  d.TPReasoning,
+		Invalidation: d.Invalidation,
+	}, nil
 }

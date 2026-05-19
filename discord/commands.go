@@ -1587,28 +1587,14 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			return
 		}
 
-		// full pipeline: prefilter + AI
-		filterResult := filter.ApplyPreFilter(coin, taResult, state)
-		if !filterResult.Pass {
-			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Embeds: &[]*discordgo.MessageEmbed{{
-					Title:       fmt.Sprintf("⏭️ %s — Skipped", coin),
-					Description: filterResult.Reason,
-					Color:       ColorYellow,
-					Footer:      &discordgo.MessageEmbedFooter{Text: randomQuote()},
-					Timestamp:   time.Now().Format(time.RFC3339),
-				}},
-			})
-			return
-		}
-
-		score, err := b.scorer.Score(ctx, coin, taResult, mc, state)
+		// execute mode — no prefilter, AI always gives a direction
+		score, err := b.scorer.Execute(ctx, coin, taResult, mc, state)
 		if err != nil {
-			slog.Error("discord: /execute AI scoring failed", "coin", coin, "err", err)
+			slog.Error("discord: /execute AI execute failed", "coin", coin, "err", err)
 			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 				Embeds: &[]*discordgo.MessageEmbed{{
 					Title:       fmt.Sprintf("❌ %s — AI Error", coin),
-					Description: fmt.Sprintf("AI scoring failed: %s", err.Error()),
+					Description: fmt.Sprintf("AI execution failed: %s", err.Error()),
 					Color:       ColorRed,
 				}},
 			})
@@ -1636,29 +1622,12 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			AIDecision: aiLog,
 		})
 
-		if score.Action != "open_long" && score.Action != "open_short" {
-			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-				Embeds: &[]*discordgo.MessageEmbed{{
-					Title:       fmt.Sprintf("⏸️ %s — %s", coin, strings.ToUpper(score.Action)),
-					Description: fmt.Sprintf("**Decision**: %s", score.Reasoning),
-					Color:       ColorYellow,
-					Fields: []*discordgo.MessageEmbedField{
-						{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
-						{Name: "Strategy", Value: score.Strategy, Inline: true},
-					},
-					Footer:    &discordgo.MessageEmbedFooter{Text: randomQuote()},
-					Timestamp: time.Now().Format(time.RFC3339),
-				}},
-			})
-			return
-		}
-
-		// AI approved — place the order
+		// Always execute — no wait/hold logic
 		var side exchange.OrderSide
-		if score.Action == "open_long" {
-			side = exchange.OrderSideLong
-		} else {
+		if score.Direction == "short" || score.Action == "open_short" {
 			side = exchange.OrderSideShort
+		} else {
+			side = exchange.OrderSideLong
 		}
 
 		orderResult, err := b.exClient.PlaceLimitOrder(ctx, coin, side, score.PositionSizeUSD, taResult.CurrentPrice, score.Leverage)
