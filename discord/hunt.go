@@ -156,7 +156,7 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			}
 
 			var wg sync.WaitGroup
-			sem := make(chan struct{}, 4) // max 4 concurrent HL+AI calls
+			sem := make(chan struct{}, 2) // max 2 concurrent HL+AI calls (avoid rate limits)
 			results := make(chan scoredResult, len(ranked))
 
 			for _, cand := range ranked {
@@ -188,6 +188,7 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					sr.score, sr.err = b.scorer.Score(ctx, c.pair, taResult, mc, state)
 					results <- sr
 				}(cand)
+				time.Sleep(300 * time.Millisecond) // stagger launches to avoid burst rate limits
 			}
 
 			go func() {

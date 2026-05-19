@@ -121,6 +121,7 @@ func (f *Fetcher) FetchOHLCV(ctx context.Context, pair, timeframe string, limit 
 		endTime.UnixMilli(),
 	)
 	if err != nil {
+		slog.Error("fetcher: HL candles failed", "pair", pair, "tf", timeframe, "raw_err", err.Error())
 		return nil, fmt.Errorf("fetcher: fetch OHLCV failed pair=%s tf=%s: %w", pair, timeframe, err)
 	}
 
