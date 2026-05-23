@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,7 +46,16 @@ func (m *xiaomiModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.St
 }
 
 func (m *xiaomiModel) GenerateObject(ctx context.Context, call fantasy.ObjectCall) (*fantasy.ObjectResponse, error) {
-	return object.GenerateWithTool(ctx, m, call)
+	resp, err := object.GenerateWithTool(ctx, m, call)
+	if err != nil {
+		var noObjErr *fantasy.NoObjectGeneratedError
+		if errors.As(err, &noObjErr) {
+			// Xiaomi sometimes ignores forced tool_choice — fall back to text mode
+			return object.GenerateWithText(ctx, m, call)
+		}
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (m *xiaomiModel) StreamObject(ctx context.Context, call fantasy.ObjectCall) (fantasy.ObjectStreamResponse, error) {
