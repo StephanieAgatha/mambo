@@ -140,26 +140,6 @@ After (Fantasy):
 
 ---
 
-## 📰 News Research Agent
-
-Before AI trade scoring, Mambo can run a **deep news sentiment scan** on the selected pair (if enabled). The `news_research_agent.md` prompt instructs the AI to:
-
-- Scan **CryptoPanic, CoinDesk, The Block, Decrypt, CoinTelegraph** + financial/community sources
-- Assign a weighted sentiment score (-1.0 to +1.0)
-- Make a **gate decision**: `PASS` / `WARN` / `SKIP`
-- Output a machine-readable JSON report
-
-```
-Gate logic:
-  SKIP  → score ≤ -0.6, or any High-impact negative event (hack, SEC, delisting)
-  WARN  → score -0.3 to -0.59, or token unlock / whale movement detected
-  PASS  → score ≥ -0.29, no red flags
-```
-
-Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforcement, delisting, founder exit, network outage > 1h.
-
----
-
 ## 📊 Technical Analysis
 
 | Indicator | Source |
@@ -374,7 +354,6 @@ Layer 11 Discord Role Auth (Go)        only authorized role can interact
 | Env loading | `github.com/joho/godotenv` |
 | Sentiment | alternative.me + Binance Public API (free) |
 | Pre-screening | Altfins batch OHLCV API |
-| News Research | AI-powered multi-source scan (CryptoPanic, CoinDesk, etc.) |
 
 ---
 
