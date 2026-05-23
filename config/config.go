@@ -48,6 +48,7 @@ const (
 	ProviderOpenAI    = "openai"
 	ProviderDeepSeek  = "deepseek"
 	ProviderAnthropic = "anthropic"
+	ProviderXiaomi    = "xiaomi"
 )
 
 // providerBaseURLs maps provider name → OpenAI-compatible base URL.
@@ -58,6 +59,7 @@ var providerBaseURLs = map[string]string{
 	ProviderDeepSeek: "https://hyper.charm.land/v1",
 	// Anthropic uses a different API format — handled in ai/client.go
 	ProviderAnthropic: "https://api.anthropic.com",
+	ProviderXiaomi:   "https://token-plan-sgp.xiaomimimo.com/v1",
 }
 
 // defaultModels maps provider name → recommended default model.
@@ -66,6 +68,7 @@ var defaultModels = map[string]string{
 	ProviderOpenAI:    "gpt-5.4",
 	ProviderDeepSeek:  "deepseek-v4-pro",
 	ProviderAnthropic: "claude-opus-4-5",
+	ProviderXiaomi:    "mimo-v1",
 }
 
 // Config holds all runtime configuration loaded from .env
@@ -87,6 +90,7 @@ type Config struct {
 	OpenAIAPIKey    string // OpenAI
 	DeepSeekAPIKey  string // DeepSeek
 	AnthropicAPIKey string // Anthropic
+	XiaomiAPIKey    string // Xiaomi Mimo
 
 	// Discord
 	DiscordBotToken         string
@@ -153,7 +157,7 @@ func Load() (*Config, error) {
 	// validate provider
 	baseURL, ok := providerBaseURLs[cfg.AIProvider]
 	if !ok {
-		return nil, fmt.Errorf("config: AI_PROVIDER %q is not supported. Valid: grok, openai, deepseek, anthropic", cfg.AIProvider)
+		return nil, fmt.Errorf("config: AI_PROVIDER %q is not supported. Valid: grok, openai, deepseek, anthropic, xiaomi", cfg.AIProvider)
 	}
 	cfg.AIBaseURL = baseURL
 
@@ -173,6 +177,7 @@ func Load() (*Config, error) {
 	cfg.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
 	cfg.DeepSeekAPIKey = os.Getenv("DEEPSEEK_API_KEY")
 	cfg.AnthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")
+	cfg.XiaomiAPIKey = os.Getenv("XIAOMI_API_KEY")
 
 	// set the active API key based on selected provider
 	switch cfg.AIProvider {
@@ -184,6 +189,8 @@ func Load() (*Config, error) {
 		cfg.AIAPIKey = cfg.DeepSeekAPIKey
 	case ProviderAnthropic:
 		cfg.AIAPIKey = cfg.AnthropicAPIKey
+	case ProviderXiaomi:
+		cfg.AIAPIKey = cfg.XiaomiAPIKey
 	}
 
 	if cfg.AIAPIKey == "" {

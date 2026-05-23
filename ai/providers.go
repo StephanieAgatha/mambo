@@ -22,8 +22,17 @@ func NewProvider(ctx context.Context, cfg *config.Config) (fantasy.Provider, err
 			anthropic.WithBaseURL(cfg.AIBaseURL),
 			anthropic.WithAPIKey(cfg.AIAPIKey),
 		)
+	case config.ProviderXiaomi:
+		// Xiaomi MiMo doesn't support native tool calling — use text mode
+		// which injects the JSON schema into the prompt instead
+		return openaicompat.New(
+			openaicompat.WithBaseURL(cfg.AIBaseURL),
+			openaicompat.WithAPIKey(cfg.AIAPIKey),
+			openaicompat.WithName(cfg.AIProvider),
+			openaicompat.WithObjectMode(fantasy.ObjectModeText),
+		)
 	default:
-		// Grok, OpenAI, DeepSeek — all OpenAI-compatible
+		// Grok, OpenAI, DeepSeek — all OpenAI-compatible with tool support
 		return openaicompat.New(
 			openaicompat.WithBaseURL(cfg.AIBaseURL),
 			openaicompat.WithAPIKey(cfg.AIAPIKey),
@@ -34,6 +43,12 @@ func NewProvider(ctx context.Context, cfg *config.Config) (fantasy.Provider, err
 
 // NewModel creates a Fantasy LanguageModel from Mambo config.
 func NewModel(ctx context.Context, cfg *config.Config) (fantasy.LanguageModel, error) {
+	if cfg.AIProvider == config.ProviderXiaomi {
+		// Xiaomi MiMo uses a raw HTTP model — bypasses Fantasy/OpenAI SDK
+		// because Xiaomi rejects extra params like parallel_tool_calls
+		return newXiaomiModel(cfg), nil
+	}
+
 	provider, err := NewProvider(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ai: create provider %s: %w", cfg.AIProvider, err)
