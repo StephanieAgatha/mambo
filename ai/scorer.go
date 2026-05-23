@@ -86,7 +86,20 @@ func generateObject[T any](
 	resp, textErr := object.GenerateWithText(ctx, model, call)
 	if textErr != nil {
 		var textNoObjErr *fantasy.NoObjectGeneratedError
-		if errors.As(textErr, &textNoObjErr) {
+		if errors.As(textErr, &textNoObjErr) && textNoObjErr.RawText != "" {
+			// Model wrapped JSON in XML tags — try extracting JSON manually
+			jsonStr := extractJSON(textNoObjErr.RawText)
+			if jsonStr != "" {
+				slog.Warn("ai: extracting JSON from XML-wrapped response", "pair", call.SchemaName)
+				var obj T
+				if unmarshalErr := json.Unmarshal([]byte(jsonStr), &obj); unmarshalErr == nil {
+					return &fantasy.ObjectResult[T]{
+						Object:  obj,
+						RawText: textNoObjErr.RawText,
+						Usage:   textNoObjErr.Usage,
+					}, nil
+				}
+			}
 			slog.Error("ai: text mode fallback also failed",
 				"err", textErr,
 				"raw_text_len", len(textNoObjErr.RawText),
@@ -125,6 +138,29 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// extractJSON finds the first top-level JSON object in a string.
+// Handles models that wrap JSON in XML tags like <reasoning>...</reasoning>.
+func extractJSON(s string) string {
+	start := strings.Index(s, "{")
+	if start == -1 {
+		return ""
+	}
+
+	depth := 0
+	for i := start; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // NewScorer loads AGENT.md and prompt files once at startup.
