@@ -43,6 +43,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	jl.CleanDecisionLog()
+
 	openPositions, err := jl.LoadPositions()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load positions error: %v\n", err)

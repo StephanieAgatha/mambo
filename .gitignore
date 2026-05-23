@@ -2,3 +2,4 @@
 terminal-wallet-cli
 mcp_config.json
 decision-log.json
+executed-log.json

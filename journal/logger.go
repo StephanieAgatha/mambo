@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	positionsFile   = "positions.json"
-	journalFile     = "journal.json"
-	decisionLogFile = "decision-log.json"
+	positionsFile    = "positions.json"
+	journalFile      = "journal.json"
+	decisionLogFile  = "decision-log.json"
+	executedLogFile  = "executed-log.json"
 )
 
 // OpenPosition represents an active futures position being monitored.
@@ -426,6 +427,64 @@ type DecisionLogEntry struct {
 // decisionLogStore is the top-level wrapper for decision-log.json
 type decisionLogStore struct {
 	Entries []DecisionLogEntry `json:"entries"`
+}
+
+// CleanDecisionLog moves executed entries to executed-log.json and clears decision-log.json.
+// Called on bot startup to keep the decision log small and preserve executed trades permanently.
+func (l *Logger) CleanDecisionLog() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	data, err := os.ReadFile(decisionLogFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("journal: read decision-log for cleanup: %w", err)
+	}
+
+	var store decisionLogStore
+	if err := json.Unmarshal(data, &store); err != nil {
+		slog.Warn("journal: decision-log.json corrupted during cleanup — resetting", "err", err)
+		return os.WriteFile(decisionLogFile, []byte(`{"entries":[]}`), 0644)
+	}
+
+	// separate executed vs non-executed
+	var executed []DecisionLogEntry
+	for _, e := range store.Entries {
+		if e.Executed {
+			executed = append(executed, e)
+		}
+	}
+
+	// append executed entries to executed-log.json
+	if len(executed) > 0 {
+		execStore := decisionLogStore{Entries: []DecisionLogEntry{}}
+		execData, err := os.ReadFile(executedLogFile)
+		if err == nil {
+			json.Unmarshal(execData, &execStore)
+		}
+		execStore.Entries = append(execStore.Entries, executed...)
+
+		pretty, err := json.MarshalIndent(execStore, "", "  ")
+		if err != nil {
+			return fmt.Errorf("journal: marshal executed-log: %w", err)
+		}
+		if err := os.WriteFile(executedLogFile, pretty, 0644); err != nil {
+			return fmt.Errorf("journal: write executed-log: %w", err)
+		}
+	}
+
+	// clear decision-log.json
+	if err := os.WriteFile(decisionLogFile, []byte(`{"entries":[]}`), 0644); err != nil {
+		return fmt.Errorf("journal: clear decision-log: %w", err)
+	}
+
+	slog.Info("decision-log cleaned",
+		"total", len(store.Entries),
+		"moved_to_executed", len(executed),
+	)
+	return nil
 }
 
 // AppendDecisionLog appends an entry to decision-log.json.

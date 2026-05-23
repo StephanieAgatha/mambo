@@ -21,11 +21,8 @@ mambo/
 ├── main.go                     # Entry point — wires all modules, Discord bot, monitor
 ├── pairs.json                  # Legacy trading universe
 ├── common_pairs.json           # Expanded trading universe (174+ pairs, 4H timeframe)
-├── analysis_log.json           # TA analysis log (per-cycle diagnostic dump)
 ├── AGENT.md                    # AI trader identity & rules (system prompt)
 ├── CLAUDE.md                   # Coding rules (auto-read by Claude CLI)
-├── news_research_agent.md      # News sentiment scan agent prompt + JSON spec
-├── fantasy.md                  # Fantasy integration plan & PRD
 ├── prompts/
 │   ├── execute_trade.md        # /execute AI prompt template
 │   ├── verify_trade.md         # Per-trade AI verification template
@@ -59,11 +56,13 @@ mambo/
 │   ├── verify.go               # /verify — HL vs Altfins candle comparison
 │   └── checker.go              # /check coin:SOL handler
 ├── journal/
-│   └── logger.go               # positions.json + journal.json (local recovery log)
+│   └── logger.go               # positions.json + journal.json + decision-log.json + executed-log.json
 ├── logger/
 │   └── logger.go               # Colored slog handler (cyan=DEBUG, green=INFO, yellow=WARN, red=ERROR)
 ├── positions.json              # Open positions (recovery on restart)
-└── journal.json                # Closed trades history (local backup, /journal uses live API)
+├── journal.json                # Closed trades history (local backup, /journal uses live API)
+├── decision-log.json           # Hunt decisions (cleared on startup, executed moves to executed-log)
+└── executed-log.json           # Permanent record of all executed trades
 ```
 
 ---
@@ -81,7 +80,7 @@ HL_TESTNET=true              # true = testnet | false = mainnet
 AI_PROVIDER=deepseek
 
 # Optional: override default model for selected provider
-# AI_MODEL=deepseek-v4-pro
+# AI_MODEL=mimo-v2.5-pro
 
 # All providers support custom base URLs for proxies / OpenRouter alternatives
 # AI_BASE_URL=https://your-proxy.com/v1
@@ -242,10 +241,10 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
    size: 5–20%, leverage: 1–10x
    /execute always executes: clamps to user-specified leverage, min size
 
-9. CONFIRMATION (Discord buttons & DMs)
+9. CONFIRMATION (Discord + decision log)
    /scan → shows "🔍 Scanning best pair…" with Accept/Decline buttons
    /hunt → screens 20 pairs/batch (Altfins), scores top 6 with AI, best wins
-   DM → each AI decision per pair sent privately (clean embed, no channel spam)
+   All hunt decisions logged to decision-log.json (executed trades → executed-log.json)
 
 10. ORDER EXECUTION
     PlaceBracketOrder: entry limit + TP trigger + SL trigger atomically
@@ -332,34 +331,15 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact. Unauthorize
 2. Batch pre-screen via Altfins (OHLCV snapshot — no per-pair API calls)
 3. Rank by volume → top 6 get full TA + AI scoring (parallel, sem=2, staggered 300ms)
 4. AI scores each pair via object.Generate[ScoreResult] — type-safe structured output
-5. Best trade (highest confidence EXECUTE action) wins → PlaceBracketOrder
-6. Monitor starts after fill (TP/SL already placed atomically)
-7. Each pair's AI decision sent as private DM — clean embed format, no channel spam
-8. All results logged to analysis_log.json for audit
+5. All decisions logged to decision-log.json (audit trail)
+6. Best trade (highest confidence >= MinConfidence) wins → PlaceBracketOrder
+7. Executed trade also logged to executed-log.json (permanent record)
+8. Monitor starts after fill (TP/SL already placed atomically)
 ```
 
-**Performance**: 20 pairs batch-screened in ~3s, top 6 AI-scored in ~30s, 5 cycles max (~2.5min delay between). All AI decisions delivered via DM so you see results immediately without opening `analysis_log.json`.
+**Log lifecycle**: On bot startup, `decision-log.json` is cleaned — executed entries move to `executed-log.json` (permanent), everything else is discarded.
 
----
-
-## 📬 Private DM Decisions
-
-Every AI decision per pair is sent via private DM — no channel clutter. Format:
-
-```
-🏹 FET-USD
-📈 LONG · momentum breakout above EMA21
-Confidence  72%
-R:R         2.85
-Confluence  6/9
-Entry       $1.2534
-Size        $2.50
-Leverage    5x
-SL          $1.2130
-TP          $1.3200
-```
-
-Non-trade decisions (hold/wait) also appear with their reasoning. Errors get a red "Error" DM. This applies to both `/hunt` and `/execute` (bypass off).
+**Performance**: 20 pairs batch-screened in ~3s, top 6 AI-scored in ~30s, 5 cycles max (~2.5min delay between).
 
 ---
 
@@ -372,7 +352,7 @@ Layer 3  Market Context (free APIs)     Fear & Greed, funding, OI, L/S ratio
 Layer 4  AI Structured Scoring          object.Generate[ScoreResult] — schema-enforced, type-safe
 Layer 5  Output Clamp (Go)             size 5–20%, leverage 1–10x
 Layer 6  Order Safety (Go)             BracketOrder: entry limit + TP/SL triggers atomically
-Layer 7  User Confirmation (Discord)   Accept/Decline/Suggest/Skip buttons on /scan trades
+Layer 7  User Confirmation (Discord)   Accept/Decline buttons on /scan; /hunt auto-executes if confident
 Layer 8  Position Fill Check (Go)      waitForFill before monitoring (TP/SL pre-placed)
 Layer 9  Position Hard Rules (Go)      drawdown, max hold, smart loss cut
 Layer 10 AI Position Management        object.Generate[PositionDecision] — hold/close/move SL/TP
@@ -418,8 +398,13 @@ go run main.go
 - Replaced regex-based AI response parsing with `object.Generate[T]` — **zero parsing errors**
 - Added `ai/providers.go` — Fantasy provider factory with custom base URL support
 - `/execute` now requires `leverage` parameter; `tp`/`sl` required for bypass mode
+- TP/SL direction validation in `/execute` (rejects backwards levels for long/short)
 - Unified order execution via `PlaceBracketOrder` (entry + TP + SL atomically)
-- Private DM for all AI decisions on `/hunt` and `/execute`
+- Price rounding to 5 significant figures + non-zero LimitPx on trigger orders (HL requirement)
+- AI fallback chain: tool mode → text mode → JSON extraction from XML-wrapped responses
+- OHLCV fetch retries up to 5x with backoff
+- `/hunt` decisions logged to `decision-log.json` (replaces DMs); executed trades → `executed-log.json`
+- Decision log cleaned on startup (non-executed entries purged, executed preserved)
 - Removed TradingView MCP integration (`/tv`, `mcp/`, `discord/tv.go`)
 - Colored logger rewrite — no more escaped ANSI codes
 - RSI + MACD divergence detection (regular, hidden, double)
