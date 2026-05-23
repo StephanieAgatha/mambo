@@ -74,8 +74,9 @@ func generateObject[T any](
 		return nil, err
 	}
 
-	slog.Warn("ai: tool-based object generation failed — retrying with text mode",
+	slog.Warn("ai: tool-based generation failed — retrying with text mode",
 		"err", err,
+		"raw_text_len", len(noObjErr.RawText),
 	)
 
 	var zero T
@@ -84,11 +85,20 @@ func generateObject[T any](
 
 	resp, textErr := object.GenerateWithText(ctx, model, call)
 	if textErr != nil {
-		return nil, err // return original error
+		var textNoObjErr *fantasy.NoObjectGeneratedError
+		if errors.As(textErr, &textNoObjErr) {
+			slog.Error("ai: text mode fallback also failed",
+				"err", textErr,
+				"raw_text_len", len(textNoObjErr.RawText),
+				"raw_text_prefix", truncate(textNoObjErr.RawText, 200),
+			)
+		}
+		return nil, textErr
 	}
 
 	var obj T
 	if unmarshalErr := unmarshalObject(resp.Object, &obj); unmarshalErr != nil {
+		slog.Error("ai: text mode returned invalid JSON", "err", unmarshalErr)
 		return nil, err
 	}
 
@@ -108,6 +118,13 @@ func unmarshalObject(obj any, target any) error {
 		return err
 	}
 	return json.Unmarshal(b, target)
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // NewScorer loads AGENT.md and prompt files once at startup.

@@ -13,7 +13,6 @@ import (
 	"mambo/config"
 	"mambo/exchange"
 	"mambo/filter"
-	"mambo/journal"
 	"mambo/market"
 	"mambo/ta"
 	aiPkg "mambo/ai"
@@ -705,36 +704,8 @@ func (b *Bot) handleScan(s *discordgo.Session, i *discordgo.InteractionCreate) {
 				aiScored++
 				score, err := b.scorer.Score(ctx, pair, taResult, mc, state)
 				if err != nil {
-					b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
-						Timestamp: journal.Now(),
-						Pair:      pair,
-						TA:        taResult,
-						Market:    mc,
-						AIError:   err.Error(),
-					})
 					continue
 				}
-
-				aiLog := &journal.AIDecisionLog{
-					Action:          score.Action,
-					Leverage:        score.Leverage,
-					PositionSizeUSD: score.PositionSizeUSD,
-					StopLoss:        score.StopLoss,
-					TakeProfit:      score.TakeProfit,
-					Confidence:      score.Confidence,
-					Strategy:        score.Strategy,
-					ConfluenceCount: score.ConfluenceCount,
-					RRRatio:         score.RRRatio,
-					Reasoning:       score.Reasoning,
-				}
-
-				b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
-					Timestamp:  journal.Now(),
-					Pair:       pair,
-					TA:         taResult,
-					Market:     mc,
-					AIDecision: aiLog,
-				})
 
 				// Any scored pair (trade, hold, wait) — show result with buttons
 				b.showScanResult(s, i, pair, taResult, mc, state, score)
@@ -1644,27 +1615,6 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			})
 			return
 		}
-
-		aiLog := &journal.AIDecisionLog{
-			Action:          score.Action,
-			Leverage:        score.Leverage,
-			PositionSizeUSD: score.PositionSizeUSD,
-			StopLoss:        score.StopLoss,
-			TakeProfit:      score.TakeProfit,
-			Confidence:      score.Confidence,
-			Strategy:        score.Strategy,
-			ConfluenceCount: score.ConfluenceCount,
-			RRRatio:         score.RRRatio,
-			Reasoning:       score.Reasoning,
-		}
-
-		b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
-			Timestamp:  journal.Now(),
-			Pair:       coin,
-			TA:         taResult,
-			Market:     mc,
-			AIDecision: aiLog,
-		})
 
 		// Send DM to user with AI decision (private, no spam)
 		userID := ""

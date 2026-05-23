@@ -109,20 +109,41 @@ func New(ctx context.Context, cfg *config.Config) *Fetcher {
 // FetchOHLCV retrieves candlestick data for a pair from Hyperliquid.
 // timeframe: "1m", "5m", "15m", "1h", "4h", "1d"
 // Returns OHLCV bars sorted ascending (oldest → newest) — required by techan.
+// Retries up to 5 times on transient failures.
 func (f *Fetcher) FetchOHLCV(ctx context.Context, pair, timeframe string, limit int) ([]OHLCV, error) {
+	const maxRetries = 5
 	endTime := time.Now()
 	startTime := endTime.Add(-estimateDuration(timeframe, limit))
 
-	rawCandles, err := f.info.CandlesSnapshot(
-		ctx,
-		pair,
-		timeframe,
-		startTime.UnixMilli(),
-		endTime.UnixMilli(),
-	)
+	var rawCandles []hyperliquid.Candle
+	var err error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt*2) * time.Second
+			slog.Warn("fetcher: retrying OHLCV fetch", "pair", pair, "attempt", attempt+1, "delay", delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		rawCandles, err = f.info.CandlesSnapshot(
+			ctx,
+			pair,
+			timeframe,
+			startTime.UnixMilli(),
+			endTime.UnixMilli(),
+		)
+		if err == nil {
+			break
+		}
+		slog.Warn("fetcher: HL candles attempt failed", "pair", pair, "tf", timeframe, "attempt", attempt+1, "err", err.Error())
+	}
+
 	if err != nil {
-		slog.Error("fetcher: HL candles failed", "pair", pair, "tf", timeframe, "raw_err", err.Error())
-		return nil, fmt.Errorf("fetcher: fetch OHLCV failed pair=%s tf=%s: %w", pair, timeframe, err)
+		return nil, fmt.Errorf("fetcher: fetch OHLCV failed pair=%s tf=%s after %d attempts: %w", pair, timeframe, maxRetries, err)
 	}
 
 	if len(rawCandles) == 0 {

@@ -1,3 +1,4 @@
 .env
 terminal-wallet-cli
 mcp_config.json
+decision-log.json

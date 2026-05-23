@@ -12,6 +12,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
+	"mambo/config"
 	"mambo/exchange"
 	"mambo/filter"
 	"mambo/journal"
@@ -45,13 +46,6 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
-
-	userID := ""
-	if i.Member != nil && i.Member.User != nil {
-		userID = i.Member.User.ID
-	} else if i.User != nil {
-		userID = i.User.ID
-	}
 
 	go func() {
 		const (
@@ -212,36 +206,28 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			var bestTA ta.TAResult
 
 			for sr := range results {
-				// log ALL scan results to analysis_log.json for audit
-				aiLog := &journal.AIDecisionLog{}
 				aiErr := ""
 				if sr.err != nil {
 					aiErr = sr.err.Error()
-				} else {
-					aiLog = &journal.AIDecisionLog{
-						Action:          sr.score.Action,
-						Leverage:        sr.score.Leverage,
-						PositionSizeUSD: sr.score.PositionSizeUSD,
-						StopLoss:        sr.score.StopLoss,
-						TakeProfit:      sr.score.TakeProfit,
-						Confidence:      sr.score.Confidence,
-						Strategy:        sr.score.Strategy,
-						ConfluenceCount: sr.score.ConfluenceCount,
-						RRRatio:         sr.score.RRRatio,
-						Reasoning:       sr.score.Reasoning,
-					}
 				}
-				b.jl.AppendAnalysisLog(journal.AnalysisLogEntry{
-					Timestamp:  journal.Now(),
-					Pair:       sr.pair,
-					TA:         sr.taResult,
-					Market:     sr.mc,
-					AIDecision: aiLog,
-					AIError:    aiErr,
-				})
 
-				// Send DM with AI decision per pair (private, no spam in channel)
-				b.sendAIDecisionDM(userID, sr)
+				// write decision to decision-log.json
+				b.jl.AppendDecisionLog(journal.DecisionLogEntry{
+					Timestamp:       journal.Now(),
+					Pair:            sr.pair,
+					Action:          sr.score.Action,
+					Leverage:        sr.score.Leverage,
+					PositionSizeUSD: sr.score.PositionSizeUSD,
+					StopLoss:        sr.score.StopLoss,
+					TakeProfit:      sr.score.TakeProfit,
+					Confidence:      sr.score.Confidence,
+					Strategy:        sr.score.Strategy,
+					ConfluenceCount: sr.score.ConfluenceCount,
+					RRRatio:         sr.score.RRRatio,
+					Reasoning:       sr.score.Reasoning,
+					Executed:        false,
+					Error:           aiErr,
+				})
 
 				if sr.err != nil {
 					continue
@@ -259,9 +245,34 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 				}
 			}
 
-			if bestPair != "" {
-				executeHuntTrade(ctx, b, s, i, bestPair, bestScore, bestTA, balance, cycle+1, totalScanned)
+			if bestPair != "" && bestScore.Confidence >= float64(config.MinConfidence) {
+				orderID := executeHuntTrade(ctx, b, s, i, bestPair, bestScore, bestTA, balance, cycle+1, totalScanned)
+				// update decision log — mark as executed
+				b.jl.AppendDecisionLog(journal.DecisionLogEntry{
+					Timestamp:       journal.Now(),
+					Pair:            bestPair,
+					Action:          bestScore.Action,
+					Leverage:        bestScore.Leverage,
+					PositionSizeUSD: bestScore.PositionSizeUSD,
+					StopLoss:        bestScore.StopLoss,
+					TakeProfit:      bestScore.TakeProfit,
+					Confidence:      bestScore.Confidence,
+					Strategy:        bestScore.Strategy,
+					ConfluenceCount: bestScore.ConfluenceCount,
+					RRRatio:         bestScore.RRRatio,
+					Reasoning:       bestScore.Reasoning,
+					Executed:        true,
+					OrderID:         orderID,
+				})
 				return
+			}
+
+			if bestPair != "" {
+				slog.Info("hunt: best pair below confidence threshold — skipping",
+					"pair", bestPair,
+					"confidence", bestScore.Confidence,
+					"min", config.MinConfidence,
+				)
 			}
 
 			updateHunting()
@@ -316,8 +327,9 @@ func mapHuntToAltfins(interval string) string {
 }
 
 // executeHuntTrade places the bracket order and starts monitoring for the best hunt candidate.
+// Returns the order ID, or 0 if the order failed.
 func executeHuntTrade(ctx context.Context, b *Bot, s *discordgo.Session, i *discordgo.InteractionCreate,
-	pair string, score aiPkg.ScoreResult, taResult ta.TAResult, balance float64, cycle, totalScanned int) {
+	pair string, score aiPkg.ScoreResult, taResult ta.TAResult, balance float64, cycle, totalScanned int) uint64 {
 
 	slog.Info("hunt: trade found — executing",
 		"pair", pair,
@@ -364,7 +376,7 @@ func executeHuntTrade(ctx context.Context, b *Bot, s *discordgo.Session, i *disc
 				Color:       ColorRed,
 			}},
 		})
-		return
+		return 0
 	}
 
 	b.StartMonitor(ctx, pair, side, taResult.CurrentPrice, sizeUSD,
@@ -398,6 +410,8 @@ func executeHuntTrade(ctx context.Context, b *Bot, s *discordgo.Session, i *disc
 		Footer:    &discordgo.MessageEmbedFooter{Text: "Auto-hunt · Altfins batch + PlaceBracketOrder"},
 		Timestamp: time.Now().Format(time.RFC3339),
 	})
+
+	return orderResult.OrderID
 }
 
 // sendAIDecisionDM sends a clean DM embed with the AI decision for a single pair.
