@@ -68,7 +68,7 @@ var defaultModels = map[string]string{
 	ProviderOpenAI:    "gpt-5.4",
 	ProviderDeepSeek:  "deepseek-v4-pro",
 	ProviderAnthropic: "claude-opus-4-5",
-	ProviderXiaomi:    "mimo-v1",
+	ProviderXiaomi:    "mimo-v2.5-pro",
 }
 
 // Config holds all runtime configuration loaded from .env
