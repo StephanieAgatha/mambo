@@ -22,6 +22,15 @@ import (
 
 // ── /hunt — Auto-Scan + Execute + Monitor ───────────────────────────────────
 
+// scoredResult holds a scored pair from the AI scan phase.
+type scoredResult struct {
+	pair     string
+	taResult ta.TAResult
+	mc       market.MarketContext
+	score    aiPkg.ScoreResult
+	err      error
+}
+
 // handleHunt scans random pairs, scores with AI, picks the best trade,
 // executes via PlaceBracketOrder, and starts monitoring. Full auto — no buttons.
 func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -36,6 +45,13 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
+
+	userID := ""
+	if i.Member != nil && i.Member.User != nil {
+		userID = i.Member.User.ID
+	} else if i.User != nil {
+		userID = i.User.ID
+	}
 
 	go func() {
 		const (
@@ -150,14 +166,6 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			}
 
 			// ── Phase 3: Full OHLCV + TA + AI for top candidates (parallel) ──
-			type scoredResult struct {
-				pair     string
-				taResult ta.TAResult
-				mc       market.MarketContext
-				score    aiPkg.ScoreResult
-				err      error
-			}
-
 			var wg sync.WaitGroup
 			sem := make(chan struct{}, 2) // max 2 concurrent HL+AI calls (avoid rate limits)
 			results := make(chan scoredResult, len(ranked))
@@ -231,6 +239,9 @@ func (b *Bot) handleHunt(s *discordgo.Session, i *discordgo.InteractionCreate) {
 					AIDecision: aiLog,
 					AIError:    aiErr,
 				})
+
+				// Send DM with AI decision per pair (private, no spam in channel)
+				b.sendAIDecisionDM(userID, sr)
 
 				if sr.err != nil {
 					continue
@@ -386,5 +397,71 @@ func executeHuntTrade(ctx context.Context, b *Bot, s *discordgo.Session, i *disc
 		Color:     ColorGreen,
 		Footer:    &discordgo.MessageEmbedFooter{Text: "Auto-hunt · Altfins batch + PlaceBracketOrder"},
 		Timestamp: time.Now().Format(time.RFC3339),
+	})
+}
+
+// sendAIDecisionDM sends a clean DM embed with the AI decision for a single pair.
+func (b *Bot) sendAIDecisionDM(userID string, sr scoredResult) {
+	if userID == "" {
+		return
+	}
+
+	if sr.err != nil {
+		b.SendDM(userID, &discordgo.MessageEmbed{
+			Title:       fmt.Sprintf("🔍 %s — Error", sr.pair),
+			Description: sr.err.Error(),
+			Color:       ColorRed,
+			Timestamp:   time.Now().Format(time.RFC3339),
+		})
+		return
+	}
+
+	actionEmoji := map[string]string{
+		"open_long":  "📈 LONG",
+		"open_short": "📉 SHORT",
+		"hold":       "⏸️ HOLD",
+		"wait":       "⏳ WAIT",
+	}[sr.score.Action]
+	if actionEmoji == "" {
+		actionEmoji = strings.ToUpper(sr.score.Action)
+	}
+
+	var color int
+	switch sr.score.Action {
+	case "open_long":
+		color = ColorGreen
+	case "open_short":
+		color = ColorRed
+	default:
+		color = ColorYellow
+	}
+
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", sr.score.Confidence), Inline: true},
+		{Name: "R:R", Value: fmt.Sprintf("%.2f", sr.score.RRRatio), Inline: true},
+		{Name: "Confluence", Value: fmt.Sprintf("%d/9", sr.score.ConfluenceCount), Inline: true},
+	}
+
+	if sr.score.Action == "open_long" || sr.score.Action == "open_short" {
+		fields = append(fields,
+			&discordgo.MessageEmbedField{Name: "Entry", Value: fmt.Sprintf("$%.4f", sr.taResult.CurrentPrice), Inline: true},
+			&discordgo.MessageEmbedField{Name: "Size", Value: fmt.Sprintf("$%.2f", sr.score.PositionSizeUSD), Inline: true},
+			&discordgo.MessageEmbedField{Name: "Leverage", Value: fmt.Sprintf("%dx", sr.score.Leverage), Inline: true},
+			&discordgo.MessageEmbedField{Name: "SL", Value: fmt.Sprintf("$%.4f", sr.score.StopLoss), Inline: true},
+			&discordgo.MessageEmbedField{Name: "TP", Value: fmt.Sprintf("$%.4f", sr.score.TakeProfit), Inline: true},
+		)
+	}
+
+	desc := fmt.Sprintf("**%s** · %s\n```%s```",
+		actionEmoji, sr.score.Strategy, sr.score.Reasoning,
+	)
+
+	b.SendDM(userID, &discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("🏹 %s", sr.pair),
+		Description: desc,
+		Color:       color,
+		Fields:      fields,
+		Footer:      &discordgo.MessageEmbedFooter{Text: "AI hunt decision · private"},
+		Timestamp:   time.Now().Format(time.RFC3339),
 	})
 }

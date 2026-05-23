@@ -1434,12 +1434,28 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 	coin := strings.ToUpper(data.Options[0].StringValue())
 	interval := "4h"
 	bypass := false
+	leverage := 5
+	var userTP float64
+	var userSL float64
+	hasUserSL := false
+	hasUserTP := false
 	for _, opt := range data.Options {
 		if opt.Name == "interval" {
 			interval = opt.StringValue()
 		}
+		if opt.Name == "leverage" {
+			leverage = int(opt.IntValue())
+		}
 		if opt.Name == "bypass" {
 			bypass = opt.BoolValue()
+		}
+		if opt.Name == "tp" {
+			userTP = opt.FloatValue()
+			hasUserTP = true
+		}
+		if opt.Name == "sl" {
+			userSL = opt.FloatValue()
+			hasUserSL = true
 		}
 	}
 
@@ -1500,17 +1516,46 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 		}
 
 		if bypass {
-			// bypass mode — execute immediately with formula defaults
+			// validate bypass requires tp and sl
+			if !hasUserTP || !hasUserSL {
+				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Embeds: &[]*discordgo.MessageEmbed{{
+						Title:       fmt.Sprintf("❌ %s — Missing TP/SL", coin),
+						Description: "Bypass mode requires both `tp` and `sl` price fields.",
+						Color:       ColorRed,
+					}},
+				})
+				return
+			}
+			if userTP <= 0 || userSL <= 0 {
+				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+					Embeds: &[]*discordgo.MessageEmbed{{
+						Title:       fmt.Sprintf("❌ %s — Invalid TP/SL", coin),
+						Description: "TP and SL prices must be positive numbers.",
+						Color:       ColorRed,
+					}},
+				})
+				return
+			}
+
+			// bypass mode — execute immediately with user-provided params
 			side := exchange.OrderSideLong
 			if taResult.CurrentPrice < taResult.EMA200 {
 				side = exchange.OrderSideShort
 			}
 
+			// clamp leverage
+			if leverage < config.MinLeverageX {
+				leverage = config.MinLeverageX
+			}
+			if leverage > config.MaxLeverageX {
+				leverage = config.MaxLeverageX
+			}
+
 			sizeUSD := balance * 0.10 // 10% of balance
 			sizeUSD = math.Round(sizeUSD*100) / 100
-			leverage := 5
 
-			orderResult, err := b.exClient.PlaceLimitOrder(ctx, coin, side, sizeUSD, taResult.CurrentPrice, leverage)
+			orderResult, err := b.exClient.PlaceBracketOrder(ctx, coin, side, sizeUSD, taResult.CurrentPrice, userTP, userSL, leverage)
 			if err != nil {
 				s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 					Embeds: &[]*discordgo.MessageEmbed{{
@@ -1522,15 +1567,7 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 				return
 			}
 
-			// bypass SL/TP: 3x ATR stop, 6x ATR target
-			bypassSL := taResult.CurrentPrice - taResult.ATR*3
-			bypassTP := taResult.CurrentPrice + taResult.ATR*6
-			if side == exchange.OrderSideShort {
-				bypassSL = taResult.CurrentPrice + taResult.ATR*3
-				bypassTP = taResult.CurrentPrice - taResult.ATR*6
-			}
-
-			b.StartMonitor(ctx, coin, side, orderResult.Price, sizeUSD, leverage, bypassSL, bypassTP, 0, "bypass", "direct execution", orderResult.OrderID)
+			b.StartMonitor(ctx, coin, side, orderResult.Price, sizeUSD, leverage, userSL, userTP, 0, "bypass", "direct execution", orderResult.OrderID)
 
 			b.SendEmbed(&discordgo.MessageEmbed{
 				Title:       fmt.Sprintf("⚡ %s %s EXECUTED (bypass)", coin, strings.ToUpper(string(side))),
@@ -1538,8 +1575,8 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 				Color:       ColorGreen,
 				Fields: []*discordgo.MessageEmbedField{
 					{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
-					{Name: "SL", Value: fmt.Sprintf("$%.4f", bypassSL), Inline: true},
-					{Name: "TP", Value: fmt.Sprintf("$%.4f", bypassTP), Inline: true},
+					{Name: "SL", Value: fmt.Sprintf("$%.4f", userSL), Inline: true},
+					{Name: "TP", Value: fmt.Sprintf("$%.4f", userTP), Inline: true},
 					{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
 					{Name: "Leverage", Value: fmt.Sprintf("%dx cross", orderResult.Leverage), Inline: true},
 					{Name: "Side", Value: strings.ToUpper(string(side)), Inline: true},
@@ -1556,8 +1593,8 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 					Color:       ColorGreen,
 					Fields: []*discordgo.MessageEmbedField{
 						{Name: "Entry", Value: fmt.Sprintf("$%.4f", orderResult.Price), Inline: true},
-						{Name: "SL", Value: fmt.Sprintf("$%.4f", bypassSL), Inline: true},
-						{Name: "TP", Value: fmt.Sprintf("$%.4f", bypassTP), Inline: true},
+						{Name: "SL", Value: fmt.Sprintf("$%.4f", userSL), Inline: true},
+						{Name: "TP", Value: fmt.Sprintf("$%.4f", userTP), Inline: true},
 						{Name: "Size", Value: fmt.Sprintf("$%.2f", orderResult.SizeUSD), Inline: true},
 						{Name: "Leverage", Value: fmt.Sprintf("%dx cross", orderResult.Leverage), Inline: true},
 						{Name: "Order ID", Value: fmt.Sprintf("%d", orderResult.OrderID), Inline: true},
@@ -1604,6 +1641,20 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			AIDecision: aiLog,
 		})
 
+		// Send DM to user with AI decision (private, no spam)
+		userID := ""
+		if i.Member != nil && i.Member.User != nil {
+			userID = i.Member.User.ID
+		} else if i.User != nil {
+			userID = i.User.ID
+		}
+		b.sendAIDecisionDM(userID, scoredResult{
+			pair:     coin,
+			taResult: taResult,
+			mc:       mc,
+			score:    score,
+		})
+
 		// Always execute — no wait/hold logic
 		var side exchange.OrderSide
 		if score.Direction == "short" || score.Action == "open_short" {
@@ -1612,7 +1663,7 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 			side = exchange.OrderSideLong
 		}
 
-		orderResult, err := b.exClient.PlaceLimitOrder(ctx, coin, side, score.PositionSizeUSD, taResult.CurrentPrice, score.Leverage)
+		orderResult, err := b.exClient.PlaceBracketOrder(ctx, coin, side, score.PositionSizeUSD, taResult.CurrentPrice, score.TakeProfit, score.StopLoss, leverage)
 		if err != nil {
 			slog.Error("discord: /execute order failed", "coin", coin, "err", err)
 			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
@@ -1627,9 +1678,9 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 
 		// TP/SL placed by monitor after position fills — not here
 
-		b.NotifyTradeExecuted(coin, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, score.Leverage, score.Confidence, score.Strategy, score.Reasoning)
+		b.NotifyTradeExecuted(coin, score.Action, taResult.CurrentPrice, score.PositionSizeUSD, leverage, score.Confidence, score.Strategy, score.Reasoning)
 
-		b.StartMonitor(ctx, coin, side, orderResult.Price, score.PositionSizeUSD, score.Leverage, score.StopLoss, score.TakeProfit, score.Confidence, score.Strategy, score.Reasoning, orderResult.OrderID)
+		b.StartMonitor(ctx, coin, side, orderResult.Price, score.PositionSizeUSD, leverage, score.StopLoss, score.TakeProfit, score.Confidence, score.Strategy, score.Reasoning, orderResult.OrderID)
 
 		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 			Embeds: &[]*discordgo.MessageEmbed{{
@@ -1641,7 +1692,7 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 					{Name: "SL", Value: fmt.Sprintf("$%.4f", score.StopLoss), Inline: true},
 					{Name: "TP", Value: fmt.Sprintf("$%.4f", score.TakeProfit), Inline: true},
 					{Name: "Size", Value: fmt.Sprintf("$%.2f", score.PositionSizeUSD), Inline: true},
-					{Name: "Leverage", Value: fmt.Sprintf("%dx cross", score.Leverage), Inline: true},
+					{Name: "Leverage", Value: fmt.Sprintf("%dx cross", leverage), Inline: true},
 					{Name: "Confidence", Value: fmt.Sprintf("%.0f%%", score.Confidence), Inline: true},
 					{Name: "Strategy", Value: score.Strategy, Inline: true},
 					{Name: "R:R", Value: fmt.Sprintf("%.2f", score.RRRatio), Inline: true},

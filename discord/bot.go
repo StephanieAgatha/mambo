@@ -12,7 +12,6 @@ import (
 	"mambo/exchange"
 	"mambo/journal"
 	"mambo/market"
-	"mambo/mcp"
 	"mambo/monitor"
 	aiPkg "mambo/ai"
 )
@@ -26,8 +25,7 @@ type Bot struct {
 	jl       *journal.Logger
 	exClient *exchange.Client
 	mon      *monitor.Monitor
-	mcpTA    *mcp.Client // tradingview-mcp subprocess; nil = fallback mode
-	mode     string      // "auto" | "manual"
+	mode     string // "auto" | "manual"
 
 	scanMu        sync.Mutex
 	activeScan    *scanResult // non-nil = waiting for user accept/decline
@@ -57,7 +55,6 @@ func New(
 	jl *journal.Logger,
 	exClient *exchange.Client,
 	mon *monitor.Monitor,
-	mcpTA *mcp.Client,
 ) (*Bot, error) {
 	if cfg.DiscordBotToken == "" {
 		return nil, fmt.Errorf("discord: DISCORD_BOT_TOKEN not set")
@@ -82,7 +79,6 @@ func New(
 		jl:       jl,
 		exClient: exClient,
 		mon:      mon,
-		mcpTA:    mcpTA,
 		mode:     "auto",
 	}
 
@@ -166,6 +162,22 @@ func (b *Bot) SendEmbed(embed *discordgo.MessageEmbed) {
 	_, err := b.session.ChannelMessageSendEmbed(b.cfg.DiscordChannelID, embed)
 	if err != nil {
 		slog.Warn("discord: failed to send embed", "err", err)
+	}
+}
+
+// SendDM sends a private embed message to a specific user.
+func (b *Bot) SendDM(userID string, embed *discordgo.MessageEmbed) {
+	if b.session == nil || userID == "" {
+		return
+	}
+	ch, err := b.session.UserChannelCreate(userID)
+	if err != nil {
+		slog.Warn("discord: failed to create DM channel", "user_id", userID, "err", err)
+		return
+	}
+	_, err = b.session.ChannelMessageSendEmbed(ch.ID, embed)
+	if err != nil {
+		slog.Warn("discord: failed to send DM", "user_id", userID, "err", err)
 	}
 }
 
@@ -277,34 +289,6 @@ func (b *Bot) registerCommands() error {
 			},
 		},
 		{
-			Name:        "tv",
-			Description: "TradingView MCP analysis + AI scoring for a specific coin",
-			Options: []*discordgo.ApplicationCommandOption{
-				{
-					Name:        "coin",
-					Description: "Ticker symbol (e.g. SOL, BTC, ETH)",
-					Type:        discordgo.ApplicationCommandOptionString,
-					Required:    true,
-				},
-				{
-					Name:        "interval",
-					Description: "Timeframe for analysis",
-					Type:        discordgo.ApplicationCommandOptionString,
-					Required:    false,
-					Choices: []*discordgo.ApplicationCommandOptionChoice{
-						{Name: "1m", Value: "1m"},
-						{Name: "5m", Value: "5m"},
-						{Name: "15m", Value: "15m"},
-						{Name: "30m", Value: "30m"},
-						{Name: "1h", Value: "1h"},
-						{Name: "4h", Value: "4h"},
-						{Name: "1d", Value: "1d"},
-						{Name: "1w", Value: "1w"},
-					},
-				},
-			},
-		},
-		{
 			Name:        "hunt",
 			Description: "Auto-scan + execute + monitor — full autonomous trade hunt",
 			Options: []*discordgo.ApplicationCommandOption{
@@ -361,6 +345,14 @@ func (b *Bot) registerCommands() error {
 					Required:    true,
 				},
 				{
+					Name:        "leverage",
+					Description: "Leverage (1-10x cross). Required for bypass mode.",
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Required:    true,
+					MinValue:    func() *float64 { v := 1.0; return &v }(),
+					MaxValue:    10,
+				},
+				{
 					Name:        "interval",
 					Description: "Timeframe for analysis",
 					Type:        discordgo.ApplicationCommandOptionString,
@@ -378,8 +370,20 @@ func (b *Bot) registerCommands() error {
 				},
 				{
 					Name:        "bypass",
-					Description: "Skip prefilter + AI — execute immediately with defaults (true/false)",
+					Description: "Skip prefilter + AI — execute immediately with your params (true/false)",
 					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Required:    false,
+				},
+				{
+					Name:        "tp",
+					Description: "Take-profit price. Required when bypass=true.",
+					Type:        discordgo.ApplicationCommandOptionNumber,
+					Required:    false,
+				},
+				{
+					Name:        "sl",
+					Description: "Stop-loss price. Required when bypass=true.",
+					Type:        discordgo.ApplicationCommandOptionNumber,
 					Required:    false,
 				},
 			},
@@ -410,8 +414,6 @@ func (b *Bot) registerCommands() error {
 			b.handleCapital(s, i)
 		case "pairs":
 			b.handlePairs(s, i)
-		case "tv":
-			b.handleTV(s, i)
 		case "hunt":
 			b.handleHunt(s, i)
 		case "scan":

@@ -102,9 +102,6 @@ type Config struct {
 	// Feature toggles
 	EnableAI bool // enable/disable AI scoring (default: true)
 
-	// MCP (optional — defaults to uvx)
-	MCPTACommand string // env: MCP_TA_COMMAND, default "uvx"
-
 	// Altfins verification (optional)
 	AltfinsAPIKey string // env: ALTFINS_API_KEY
 }
@@ -226,12 +223,6 @@ func Load() (*Config, error) {
 		} else {
 			cfg.EnableAI = enabled
 		}
-	}
-
-	// ── MCP TA command ──────────────────────────────────────────────────────
-	cfg.MCPTACommand = os.Getenv("MCP_TA_COMMAND")
-	if cfg.MCPTACommand == "" {
-		cfg.MCPTACommand = "uvx"
 	}
 
 	// ── Altfins verification (optional) ────────────────────────────────────

@@ -4,13 +4,13 @@
 > Built with Go. Disciplined. Emotionless. Balance-aware. Multi-provider AI.
 <img width="558" height="540" alt="mamboooo" src="https://github.com/user-attachments/assets/f3f3f9c9-00d9-49a4-bb7f-d5e61782696c" />
 
-
-
 ---
 
 ## 📌 Overview
 
-Mambo AI Trade autonomously scans crypto pairs, performs technical analysis using the **techan** library + custom support/resistance detection, runs an AI-powered **news sentiment scan** (CryptoPanic, CoinDesk, The Block, etc.), consults an AI trading agent, and executes cross margin limit orders on Hyperliquid Futures — all within a dynamic, balance-aware rule set. Supports multiple AI providers (Grok, OpenAI, DeepSeek, Anthropic) switchable via `.env`. You monitor and control everything through a private Discord bot with role-based access control.
+Mambo AI Trade autonomously scans crypto pairs, performs technical analysis using the **techan** library + custom support/resistance detection, consults an AI trading agent via **[Charmbracelet Fantasy](https://github.com/charmbracelet/fantasy)** for **structured, type-safe decisions** (no regex parsing), and executes bracket orders on Hyperliquid Futures — all within a dynamic, balance-aware rule set.
+
+Supports multiple AI providers (Grok, OpenAI, DeepSeek, Anthropic) switchable via `.env`. You monitor and control everything through a private Discord bot with role-based access control and **private DMs** for per-pair AI decisions.
 
 ---
 
@@ -25,7 +25,9 @@ mambo/
 ├── AGENT.md                    # AI trader identity & rules (system prompt)
 ├── CLAUDE.md                   # Coding rules (auto-read by Claude CLI)
 ├── news_research_agent.md      # News sentiment scan agent prompt + JSON spec
+├── fantasy.md                  # Fantasy integration plan & PRD
 ├── prompts/
+│   ├── execute_trade.md        # /execute AI prompt template
 │   ├── verify_trade.md         # Per-trade AI verification template
 │   └── suggest_trade.md        # AI advisory suggestion template (DYOR mode)
 ├── .env                        # All secrets + feature flags
@@ -33,29 +35,33 @@ mambo/
 ├── config/
 │   └── config.go               # Env loader, constants, multi-provider AI config
 ├── market/
-│   ├── fetcher.go              # OHLCV + sentiment (alternative.me, Binance)
+│   ├── fetcher.go              # OHLCV + sentiment (alternative.me, Binance, Altfins)
 │   └── pairs.go                # Load / get random pairs from pairs.json
 ├── ta/
-│   └── indicators.go           # techan wrapper + swing S/R detection
+│   ├── indicators.go           # techan wrapper + swing S/R detection
+│   └── divergence.go           # RSI + MACD divergence detection
 ├── filter/
 │   └── rules.go                # Hard-coded pre-AI filter rules
 ├── ai/
-│   ├── client.go               # Provider router (Grok/OpenAI/DeepSeek/Anthropic)
-│   ├── scorer.go               # Trade scoring — EXECUTE/ABORT + size + leverage
-│   └── position_manager.go     # Position management — hold/close/move SL/TP
+│   ├── providers.go            # Fantasy provider factory (Grok/OpenAI/DeepSeek/Anthropic)
+│   ├── client.go               # Legacy HTTP client (kept for backward compat)
+│   ├── scorer.go               # Structured trade scoring via object.Generate[ScoreResult]
+│   └── position_manager.go     # Structured position decisions via object.Generate[PositionDecision]
 ├── exchange/
-│   └── hyperliquid.go          # go-hyperliquid SDK wrapper
+│   └── hyperliquid.go          # go-hyperliquid SDK wrapper (PlaceBracketOrder, PlaceTriggerOrder)
 ├── monitor/
 │   └── position.go             # Two-ticker goroutine (price + AI intervals)
 ├── discord/
-│   ├── bot.go                  # Init, slash commands, role auth, StartMonitor
+│   ├── bot.go                  # Init, slash commands, role auth, StartMonitor, SendDM
 │   ├── notify.go               # Embed notifications + motivational quotes
-│   ├── commands.go             # Slash command handlers (/check, /execute, /journal, /pnl, etc.)
+│   ├── commands.go             # Slash command handlers (/check, /execute, /scan, etc.)
+│   ├── hunt.go                 # /hunt — auto-scan + execute (Altfins batch + AI scoring + DMs)
+│   ├── verify.go               # /verify — HL vs Altfins candle comparison
 │   └── checker.go              # /check coin:SOL handler
 ├── journal/
 │   └── logger.go               # positions.json + journal.json (local recovery log)
 ├── logger/
-│   └── logger.go               # Color slog handler
+│   └── logger.go               # Colored slog handler (cyan=DEBUG, green=INFO, yellow=WARN, red=ERROR)
 ├── positions.json              # Open positions (recovery on restart)
 └── journal.json                # Closed trades history (local backup, /journal uses live API)
 ```
@@ -72,10 +78,13 @@ HL_TESTNET=true              # true = testnet | false = mainnet
 
 # ── AI Provider ──────────────────────────────────────────
 # Choose: grok | openai | deepseek | anthropic
-AI_PROVIDER=grok
+AI_PROVIDER=deepseek
 
 # Optional: override default model for selected provider
-# AI_MODEL=grok-4.20-0309-reasoning
+# AI_MODEL=deepseek-v4-pro
+
+# All providers support custom base URLs for proxies / OpenRouter alternatives
+# AI_BASE_URL=https://your-proxy.com/v1
 
 # ── AI API Keys (only fill the one matching AI_PROVIDER) ─
 XAI_API_KEY=xai-...          # Grok     → console.x.ai
@@ -92,28 +101,49 @@ DISCORD_AUTHORIZED_ROLE_ID=
 # ── Monitor Intervals ─────────────────────────────────────
 MONITOR_PRICE_SEC=10         # Price + hard rules (min 5s, default 10s)
 MONITOR_AI_SEC=1200          # AI position analysis (min 60s, default 20min)
+
+# ── Altfins (optional) ───────────────────────────────────
+ALTFINS_API_KEY=             # Altfins API key for batch OHLCV pre-screening
 ```
 
 ---
 
-## 🤖 AI Providers
+## 🤖 AI Providers & Structured Output
 
-Mambo supports multiple AI providers switchable via `AI_PROVIDER` in `.env`. Only the API key for the selected provider is required.
+Mambo uses **[Charmbracelet Fantasy](https://github.com/charmbracelet/fantasy)** for all AI calls. Fantasy provides:
 
-| Provider | Value | Default Model | API Format |
+- **Unified provider interface** — Grok, OpenAI, DeepSeek, Anthropic via a single API
+- **Structured output** — `object.Generate[ScoreResult]` returns a fully typed Go struct. Zero regex parsing. Zero "no decision block" errors.
+- **Custom base URLs** — route through proxies, OpenRouter alternatives, or self-hosted models
+
+### Supported Providers
+
+| Provider | Value | Default Model | Fantasy Backend |
 |---|---|---|---|
-| **Grok (xAI)** | `grok` | `grok-4.20-0309-reasoning` | OpenAI-compatible |
-| **OpenAI** | `openai` | `gpt-4o` | OpenAI-compatible |
-| **DeepSeek** | `deepseek` | `deepseek-reasoner` | OpenAI-compatible |
-| **Anthropic** | `anthropic` | `claude-opus-4-5` | Custom (handled internally) |
+| **Grok (xAI)** | `grok` | `grok-4.20-0309-reasoning` | `openaicompat` |
+| **OpenAI** | `openai` | `gpt-5.4` | `openaicompat` |
+| **DeepSeek** | `deepseek` | `deepseek-v4-pro` | `openaicompat` |
+| **Anthropic** | `anthropic` | `claude-opus-4-5` | `anthropic` (native) |
 
 To switch provider: change `AI_PROVIDER` and set the matching API key. No code changes needed.
+
+### How Structured Output Works
+
+```
+Before (regex parsing):
+  AI text → regex hunt for <decision> → json.Unmarshal → ScoreResult
+  ❌ "no decision block in AI response" when formatting drifts
+
+After (Fantasy):
+  object.Generate[ScoreResult] → ScoreResult (directly typed)
+  ✅ Schema auto-generated from Go struct tags — AI always returns valid JSON
+```
 
 ---
 
 ## 📰 News Research Agent
 
-Before AI trade scoring, Mambo runs a **deep news sentiment scan** on the selected pair (if enabled). The `news_research_agent.md` prompt instructs the AI to:
+Before AI trade scoring, Mambo can run a **deep news sentiment scan** on the selected pair (if enabled). The `news_research_agent.md` prompt instructs the AI to:
 
 - Scan **CryptoPanic, CoinDesk, The Block, Decrypt, CoinTelegraph** + financial/community sources
 - Assign a weighted sentiment score (-1.0 to +1.0)
@@ -136,8 +166,8 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 | Indicator | Source |
 |---|---|
 | EMA 9, 21, 50, 200 | `github.com/sdcoffey/techan` |
-| RSI 14 + divergence | techan |
-| MACD (12,26,9) + divergence | techan |
+| RSI 14 + divergence | techan + custom divergence detection |
+| MACD (12,26,9) + divergence | techan + custom divergence detection |
 | Bollinger Bands (20,2) | techan |
 | ATR 14 (dynamic SL) | techan |
 | OBV | techan |
@@ -149,6 +179,11 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 - **Strength** = `strong` (3+ tests), `moderate` (2), `weak` (1)
 - `AtSupport = true` → +1 confluence, can size up
 - `NearResistance = true` → size down automatically
+
+### Divergence Detection
+- **RSI Divergence**: Regular (trend reversal) / Hidden (trend continuation)
+- **MACD Divergence**: Regular / Hidden
+- **Double Divergence**: RSI + MACD agree — highest confidence signal
 
 ---
 
@@ -171,7 +206,7 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 ```
 1. STARTUP
    Load config + AGENT.md + pairs.json
-   Init AI client (provider from AI_PROVIDER env var)
+   Init Fantasy provider → LanguageModel (structured output ready)
    Register Discord slash commands
    Recover positions.json → spawn monitor goroutines
 
@@ -182,6 +217,7 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 4. TECHNICAL ANALYSIS
    EMA 9/21/50/200, RSI 14, MACD, BB, ATR, OBV (techan)
    Support/Resistance swing point detection (custom)
+   RSI + MACD divergence detection
 
 5. PRE-FILTER (hard rules, no AI)
    ❌ EMA spread < 0.2%       → skip (sideways)
@@ -195,31 +231,34 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 6. ENRICH CONTEXT (free APIs)
    Fear & Greed, Funding rate, OI, Long/Short ratio
 
-7. AI SCORING (configured provider)
+7. AI SCORING (Fantasy structured output)
+   object.Generate[ScoreResult] → schema-driven, type-safe
    Input: all TA + S/R + market context + portfolio state
    Output: open_long / open_short / hold / wait + size + leverage + strategy
 
 8. VALIDATE + CLAMP (Go code — AI cannot bypass)
-   confidence < 55% → force wait
+   confidence < 50% → force wait
    R:R < 2.0 → force wait
    size: 5–20%, leverage: 1–10x
+   /execute always executes: clamps to user-specified leverage, min size
 
-9. CONFIRMATION (Discord buttons)
-   /scan → shows "🔍 Scanning best pair…" during search
-   Trade found → Accept/Decline buttons with entry, SL, TP, confidence
-   Skipped pair → Suggest/Skip buttons (AI advisory opinion)
-   Hold/wait  → Suggest/Skip buttons (AI analyses and gives trade idea)
+9. CONFIRMATION (Discord buttons & DMs)
+   /scan → shows "🔍 Scanning best pair…" with Accept/Decline buttons
+   /hunt → screens 20 pairs/batch (Altfins), scores top 6 with AI, best wins
+   DM → each AI decision per pair sent privately (clean embed, no channel spam)
 
 10. ORDER EXECUTION
-   Limit order, cross margin
-   Auto-saves position → spawns monitor goroutine
+    PlaceBracketOrder: entry limit + TP trigger + SL trigger atomically
+    All 3 orders via BulkOrders — TP/SL activated after fill
+    Cross margin, leverage set before orders
+    Auto-saves position → spawns monitor goroutine
 
 11. MONITOR (two tickers, starts after position fills)
-   WaitForFill → confirm position exists on exchange
-   Place TP/SL trigger orders (reduce-only, visible on Hyperliquid UI)
-   priceTicker (MonitorPriceSec) → TP/SL/hard rules
-   aiTicker    (MonitorAISec)    → AI position analysis
-   Auto-closes position → Discord notification → logged to journal.json
+    WaitForFill → confirm position exists on exchange (polls every 15s, 120min timeout)
+    TP/SL already placed by PlaceBracketOrder (visible on Hyperliquid UI)
+    priceTicker (MonitorPriceSec) → TP/SL hit, hard rules
+    aiTicker    (MonitorAISec)    → AI position analysis (Fantasy structured output)
+    Auto-closes position → Discord notification → logged to journal.json
 ```
 
 ---
@@ -229,17 +268,18 @@ Hard overrides (auto-SKIP): exchange hack, smart contract exploit, SEC enforceme
 ```
 waitForFill (up to 120min, polls every 15s):
   Confirms position exists on exchange before monitoring begins
-  Places TP/SL trigger orders (reduce-only, visible on Hyperliquid UI)
+  TP/SL already placed atomically by PlaceBracketOrder
   On timeout: cleans up position record (no trade logged)
 
 priceTicker (fast — default 10s):
   TP/SL hit, drawdown ≥ 40%, hold > 240min, smart loss cut
 
 aiTicker (slow — default 20min, configurable):
-  Fetch fresh TA + S/R → send to AI → hold/close/move_sl/move_tp
-  AI is S/R aware:
+  Fetch fresh TA + S/R → AI via object.Generate[PositionDecision] → hold/close/move_sl/move_tp
+  AI is S/R + divergence aware:
     Near resistance + PnL > 3% → consider closing
-    Bouncing off support → hold, tighten SL
+    Hidden bullish divergence + long in drawdown → hold
+    Double divergence (RSI + MACD agree) → weight heavily
 ```
 
 ---
@@ -247,30 +287,79 @@ aiTicker (slow — default 20min, configurable):
 ## 🤖 Discord Bot
 
 ### Role-Based Access
-Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
+Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact. Unauthorized users get no response.
 
 ### Slash Commands
+
+| Command | Description |
+|---|---|
+| `/check coin:SOL [interval:4h]` | TA + AI analysis with S/R levels (read-only) |
+| `/hunt [interval:4h]` | Auto-scan pairs, AI scores best, auto-execute + monitor. Wraps when exhausted. |
+| `/execute coin:SOL leverage:5 [interval:4h] [bypass:false] [tp:120] [sl:95]` | Full pipeline (bypass=false) or direct execution (bypass=true) |
+| `/scan [interval:4h]` | Scan random pairs for trade setup (Accept/Decline/Suggest/Skip buttons) |
+| `/status` | Open positions + live PnL from exchange |
+| `/journal [range:today] [page:1]` | Trade history from Hyperliquid (today or week, paginated) |
+| `/pnl` | Total PnL + per-coin breakdown (live from Hyperliquid) |
+| `/mode auto\|manual` | Toggle trading mode |
+| `/capital` | Balance + limits + remaining budget |
+| `/pairs` | Active trading pairs |
+| `/verify coin:SOL [interval:1d]` | HL vs Altfins candle comparison with deviation % |
+
+### /execute Parameters
+
+| Parameter | Required | Description |
+|---|---|---|
+| `coin` | ✅ | Ticker symbol (e.g. SOL, BTC) |
+| `leverage` | ✅ | 1–10x cross margin (clamped if out of range) |
+| `interval` | ❌ | Timeframe (default: 4h) |
+| `bypass` | ❌ | Skip prefilter + AI — execute immediately (default: false) |
+| `tp` | ❌* | Take-profit price — **required when bypass=true** |
+| `sl` | ❌* | Stop-loss price — **required when bypass=true** |
+
+| Mode | Leverage | Direction | Size | TP/SL | Entry |
+|---|---|---|---|---|---|
+| `bypass:false` | User-specified (clamped 1-10x) | AI decides | AI decides (5-20%) | AI decides | Current price (BracketOrder) |
+| `bypass:true` | User-specified (clamped 1-10x) | LONG if > EMA200, else SHORT | 10% balance | User-specified (required) | Current price (BracketOrder) |
+
+---
+
+## 🏹 /hunt — Autonomous Trade Hunting
+
+/hunt automatically finds and executes the best trade across the entire pair universe:
+
 ```
-/check  coin:SOL           → TA + AI analysis with S/R levels (read-only)
-/execute coin:SOL          → full pipeline: prefilter → AI → execute if approved
-/execute coin:SOL bypass:true → skip prefilter + AI, execute immediately with defaults
-/scan                      → scan random pairs for trade setup (auto-retry 3×, 3min delay)
-                            Accept/Decline on trades, Suggest/Skip on skipped pairs
-                            "🔍 Scanning best pair…" displayed during search
-/status                    → open positions + live PnL
-/journal                   → today's trades (live from Hyperliquid, paginated)
-/journal week              → last 7 days
-/journal week page:2       → page 2 of 7-day journal
-/pnl                       → total PnL + per-coin breakdown (live from Hyperliquid)
-/mode  auto|manual         → toggle mode
-/capital                   → balance + limits + budget
-/pairs                     → active pairs
+1. Pick 20 random unseen pairs (wraps around when all exhausted)
+2. Batch pre-screen via Altfins (OHLCV snapshot — no per-pair API calls)
+3. Rank by volume → top 6 get full TA + AI scoring (parallel, sem=2, staggered 300ms)
+4. AI scores each pair via object.Generate[ScoreResult] — type-safe structured output
+5. Best trade (highest confidence EXECUTE action) wins → PlaceBracketOrder
+6. Monitor starts after fill (TP/SL already placed atomically)
+7. Each pair's AI decision sent as private DM — clean embed format, no channel spam
+8. All results logged to analysis_log.json for audit
 ```
 
-| Mode | Direction | Size | Leverage | Entry |
-|---|---|---|---|---|
-| `bypass:false` | AI decides | AI decides (5–20%) | AI decides (1–10x) | Current price (limit) |
-| `bypass:true` | LONG if > EMA200, else SHORT | 10% balance | 5x | Current price (limit) |
+**Performance**: 20 pairs batch-screened in ~3s, top 6 AI-scored in ~30s, 5 cycles max (~2.5min delay between). All AI decisions delivered via DM so you see results immediately without opening `analysis_log.json`.
+
+---
+
+## 📬 Private DM Decisions
+
+Every AI decision per pair is sent via private DM — no channel clutter. Format:
+
+```
+🏹 FET-USD
+📈 LONG · momentum breakout above EMA21
+Confidence  72%
+R:R         2.85
+Confluence  6/9
+Entry       $1.2534
+Size        $2.50
+Leverage    5x
+SL          $1.2130
+TP          $1.3200
+```
+
+Non-trade decisions (hold/wait) also appear with their reasoning. Errors get a red "Error" DM. This applies to both `/hunt` and `/execute` (bypass off).
 
 ---
 
@@ -280,13 +369,13 @@ Only Discord members with `DISCORD_AUTHORIZED_ROLE_ID` can interact.
 Layer 1  Trend Gate (Go)               EMA spread < 0.2% → skip
 Layer 2  Pre-filter Rules (Go)          RSI, EMA, volume, budget
 Layer 3  Market Context (free APIs)     Fear & Greed, funding, OI, L/S ratio
-Layer 4  AI Trade Scoring               confidence ≥ 55%, R:R ≥ 2.0, S/R aware
+Layer 4  AI Structured Scoring          object.Generate[ScoreResult] — schema-enforced, type-safe
 Layer 5  Output Clamp (Go)             size 5–20%, leverage 1–10x
-Layer 6  Order Safety (Go)             limit only, cross margin
-Layer 7  User Confirmation (Discord)   Accept/Decline buttons on every trade
-Layer 8  Position Fill Check (Go)      waitForFill before monitoring + TP/SL
+Layer 6  Order Safety (Go)             BracketOrder: entry limit + TP/SL triggers atomically
+Layer 7  User Confirmation (Discord)   Accept/Decline/Suggest/Skip buttons on /scan trades
+Layer 8  Position Fill Check (Go)      waitForFill before monitoring (TP/SL pre-placed)
 Layer 9  Position Hard Rules (Go)      drawdown, max hold, smart loss cut
-Layer 10 AI Position Management        hold/close/move SL/TP, S/R aware
+Layer 10 AI Position Management        object.Generate[PositionDecision] — hold/close/move SL/TP
 Layer 11 Discord Role Auth (Go)        only authorized role can interact
 ```
 
@@ -297,20 +386,22 @@ Layer 11 Discord Role Auth (Go)        only authorized role can interact
 | Component | Technology |
 |---|---|
 | Language | Go |
-| Exchange SDK | `github.com/sonirico/go-hyperliquid` |
-| AI Providers | Grok / OpenAI / DeepSeek / Anthropic (switchable) |
-| TA Library | `github.com/sdcoffey/techan` + custom S/R |
+| Exchange SDK | `github.com/sonirico/go-hyperliquid` v0.36 |
+| AI Framework | `charm.land/fantasy` v0.25 — structured output, multi-provider |
+| AI Providers | Grok / OpenAI / DeepSeek / Anthropic (switchable via `.env`) |
+| TA Library | `github.com/sdcoffey/techan` + custom S/R + divergence |
 | Discord | `github.com/bwmarrin/discordgo` |
 | Env loading | `github.com/joho/godotenv` |
 | Sentiment | alternative.me + Binance Public API (free) |
-| News Research | AI-powered multi-source scan (CryptoPanic, CoinDesk, The Block, etc.) |
+| Pre-screening | Altfins batch OHLCV API |
+| News Research | AI-powered multi-source scan (CryptoPanic, CoinDesk, etc.) |
 
 ---
 
 ## 🚀 Getting Started
 
 ```bash
-git clone https://github.com/yourname/mambo
+git clone https://github.com/StephanieAgatha/mambo
 cd mambo
 go mod tidy
 cp .env.example .env
@@ -321,28 +412,34 @@ go run main.go
 
 ---
 
-## 📋 Phase Roadmap
+## 📋 Changelog
 
-```
-Phase A  ✅  Foundation
-Phase B  ✅  Hyperliquid SDK + market fetcher
-Phase C  ✅  TA (techan) + S/R detection
-Phase D  ✅  Pre-filter + AI scorer (multi-provider)
-Phase E  ✅  Journal
-Phase F  ✅  Position monitor (two-ticker)
-Phase G  ✅  Discord bot (slash commands, embeds, role auth)
-Phase H  ✅  Main scan loop (full wiring)
+### v3 — Fantasy Integration (current)
+- Replaced regex-based AI response parsing with `object.Generate[T]` — **zero parsing errors**
+- Added `ai/providers.go` — Fantasy provider factory with custom base URL support
+- `/execute` now requires `leverage` parameter; `tp`/`sl` required for bypass mode
+- Unified order execution via `PlaceBracketOrder` (entry + TP + SL atomically)
+- Private DM for all AI decisions on `/hunt` and `/execute`
+- Removed TradingView MCP integration (`/tv`, `mcp/`, `discord/tv.go`)
+- Colored logger rewrite — no more escaped ANSI codes
+- RSI + MACD divergence detection (regular, hidden, double)
 
-Extras  ✅  AI Suggest flow (advisory suggestions for skipped/wait/hold pairs)
-         ✅  TP/SL bracket orders (reduce-only, placed after position fill)
-         ✅  waitForFill (monitor confirms position exists before acting)
-         ✅  Expanded pairs universe (174+ coins in common_pairs.json)
-         ✅  Analysis log (per-cycle TA dump to analysis_log.json)
+### v2 — May 2026
+- `/hunt` — autonomous trade hunting with Altfins batch pre-screening
+- Wrap-around pair exhaustion (resets seen pairs when all scanned)
+- AI client retry on 5xx/timeout (up to 3 attempts with backoff)
+- TP/SL trigger orders via `PlaceTriggerOrder` + `PlaceBracketOrder`
+- `waitForFill` — monitor waits for position to fill before acting
+- Altfins `FlexFloat` unmarshaling for both JSON strings and numbers
+- `/verify` — Hyperliquid vs Altfins candle comparison command
 
-Phase 2 (later):
-  → Top Gainers/Losers 24h (Asterdex API)
-  → Chart generation (go-chart PNG to Discord)
-```
+### v1 — Initial Release
+- Foundation: config, exchange SDK, market fetcher
+- TA with techan + custom S/R detection
+- Pre-filter hard rules + multi-provider AI scoring
+- Discord bot with slash commands, embeds, role auth
+- Two-ticker position monitor (price + AI intervals)
+- Journal: positions.json + journal.json with WIB timestamps
 
 ---
 

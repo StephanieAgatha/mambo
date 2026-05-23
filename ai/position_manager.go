@@ -2,13 +2,13 @@ package ai
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
-	"regexp"
-	"strings"
 	"time"
+
+	"charm.land/fantasy"
+	"charm.land/fantasy/object"
 
 	"mambo/config"
 	"mambo/journal"
@@ -17,16 +17,16 @@ import (
 
 // PositionDecision is the AI's decision for an open position.
 type PositionDecision struct {
-	Action    string  // "hold" / "close" / "move_sl" / "move_tp"
-	NewSL     float64 // only used when Action == "move_sl"
-	NewTP     float64 // only used when Action == "move_tp"
-	Reasoning string
+	Action    string  `json:"action"`    // "hold" / "close" / "move_sl" / "move_tp"
+	NewSL     float64 `json:"new_sl"`     // only used when Action == "move_sl"
+	NewTP     float64 `json:"new_tp"`     // only used when Action == "move_tp"
+	Reasoning string  `json:"reasoning"`
 }
 
 // PositionManager sends live position state to the configured AI and parses its decision.
 type PositionManager struct {
 	agentPrompt string
-	client      *Client
+	model       fantasy.LanguageModel
 	cfg         *config.Config
 }
 
@@ -37,8 +37,10 @@ func NewPositionManager(cfg *config.Config) (*PositionManager, error) {
 		return nil, fmt.Errorf("position_manager: read AGENT.md: %w", err)
 	}
 
-	// position decisions are simpler — shorter timeout than trade scoring
-	client := NewClient(cfg, 60*time.Second)
+	model, err := NewModel(context.Background(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("position_manager: create fantasy model: %w", err)
+	}
 
 	slog.Info("position manager initialized",
 		"provider", cfg.AIProvider,
@@ -47,7 +49,7 @@ func NewPositionManager(cfg *config.Config) (*PositionManager, error) {
 
 	return &PositionManager{
 		agentPrompt: string(data),
-		client:      client,
+		model:       model,
 		cfg:         cfg,
 	}, nil
 }
@@ -71,24 +73,20 @@ func (pm *PositionManager) Decide(
 		"pnl_pct", fmt.Sprintf("%.2f%%", currentPnLPct),
 	)
 
-	raw, err := pm.client.Chat(ctx, pm.agentPrompt, prompt)
+	result, err := object.Generate[PositionDecision](ctx, pm.model, fantasy.ObjectCall{
+		Prompt:            fantasy.Prompt{fantasy.NewSystemMessage(pm.agentPrompt), fantasy.NewUserMessage(prompt)},
+		SchemaName:        "position_decision",
+		SchemaDescription: "A position management decision: hold, close, move_sl, or move_tp",
+	})
 	if err != nil {
-		return PositionDecision{}, fmt.Errorf("position_manager: AI call failed pos=%s: %w", pos.ID, err)
-	}
-
-	decision, err := parsePositionDecision(raw)
-	if err != nil {
-		// parse failure → safe fallback: hold
-		slog.Warn("position_manager: parse failed — defaulting to hold",
+		slog.Warn("position_manager: AI call failed — defaulting to hold",
 			"pos_id", pos.ID,
-			"provider", pm.cfg.AIProvider,
 			"err", err,
 		)
-		return PositionDecision{Action: "hold", Reasoning: "parse error — holding"}, nil
+		return PositionDecision{Action: "hold", Reasoning: "AI call failed — holding"}, nil
 	}
 
-	// validate — AI cannot bypass hard constraints
-	decision = pm.validate(decision, pos)
+	decision := pm.validate(result.Object, pos)
 
 	slog.Debug("position decision",
 		"pos_id", pos.ID,
@@ -182,35 +180,6 @@ Respond ONLY in this exact format:
 		string(snap.MACDDivergence), snap.MACDDivBarsAgo,
 		snap.DoubleDivergence,
 	)
-}
-
-// parsePositionDecision extracts the <decision> JSON block from AI response.
-func parsePositionDecision(raw string) (PositionDecision, error) {
-	re := regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
-	matches := re.FindStringSubmatch(raw)
-	if len(matches) < 2 {
-		return PositionDecision{}, fmt.Errorf("no <decision> block in response")
-	}
-
-	jsonStr := strings.TrimSpace(matches[1])
-
-	var parsed struct {
-		Action    string  `json:"action"`
-		NewSL     float64 `json:"new_sl"`
-		NewTP     float64 `json:"new_tp"`
-		Reasoning string  `json:"reasoning"`
-	}
-
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return PositionDecision{}, fmt.Errorf("unmarshal decision JSON: %w", err)
-	}
-
-	return PositionDecision{
-		Action:    parsed.Action,
-		NewSL:     parsed.NewSL,
-		NewTP:     parsed.NewTP,
-		Reasoning: parsed.Reasoning,
-	}, nil
 }
 
 // validate enforces hard constraints on AI position decisions.
