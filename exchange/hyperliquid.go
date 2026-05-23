@@ -250,6 +250,7 @@ func (c *Client) PlaceLimitOrder(
 	}
 
 	isBuy := side == OrderSideLong
+	price = c.roundPrice(ctx, pair, price)
 	sizeCoins := sizeUSD / price
 
 	// round size to the pair's szDecimals to avoid Hyperliquid rounding errors
@@ -329,6 +330,15 @@ func (c *Client) PlaceTriggerOrder(
 ) error {
 	// Trigger orders reverse the side: a long position closes with a sell
 	isBuy := side == OrderSideShort
+	triggerPrice = c.roundPrice(ctx, pair, triggerPrice)
+
+	// LimitPx must be non-zero — HL uses it as worst-case guard rail.
+	// Sell: 90% of trigger. Buy: 110%.
+	limitPx := triggerPrice * 0.9
+	if isBuy {
+		limitPx = triggerPrice * 1.1
+	}
+	limitPx = c.roundPrice(ctx, pair, limitPx)
 
 	// Round size to the pair's szDecimals — same as entry order
 	decimals := c.szDecimalsForPair(ctx, pair)
@@ -343,7 +353,7 @@ func (c *Client) PlaceTriggerOrder(
 		Coin:       pair,
 		IsBuy:      isBuy,
 		Size:       coinSize,
-		Price:      triggerPrice,
+		Price:      limitPx,
 		ReduceOnly: true,
 		OrderType: hyperliquid.OrderType{
 			Trigger: &hyperliquid.TriggerOrderType{
@@ -512,10 +522,26 @@ func (c *Client) PlaceBracketOrder(
 
 	isBuy := side == OrderSideLong
 
+	// Round all prices to Hyperliquid's 5-significant-figures requirement
+	entryPrice = c.roundPrice(ctx, pair, entryPrice)
+	takeProfitPrice = c.roundPrice(ctx, pair, takeProfitPrice)
+	stopLossPrice = c.roundPrice(ctx, pair, stopLossPrice)
+
 	// Round size to pair's szDecimals — same logic as PlaceLimitOrder
 	decimals := c.szDecimalsForPair(ctx, pair)
 	roundFactor := math.Pow(10, float64(decimals))
 	sizeCoins := math.Round((sizeUSD/entryPrice)*roundFactor) / roundFactor
+
+	// Trigger orders need a non-zero LimitPx (Price) as worst-case guard rail.
+	// Sell: 90% of trigger (willing to accept lower). Buy: 110% (willing to pay more).
+	slLimitPx := stopLossPrice * 0.9
+	tpLimitPx := takeProfitPrice * 0.9
+	if isBuy {
+		slLimitPx = stopLossPrice * 1.1
+		tpLimitPx = takeProfitPrice * 1.1
+	}
+	slLimitPx = c.roundPrice(ctx, pair, slLimitPx)
+	tpLimitPx = c.roundPrice(ctx, pair, tpLimitPx)
 
 	orders := []hyperliquid.CreateOrderRequest{
 		// (A) Entry — limit GTC, opens position
@@ -532,7 +558,7 @@ func (c *Client) PlaceBracketOrder(
 			Coin:       pair,
 			IsBuy:      !isBuy,
 			Size:       sizeCoins,
-			Price:      0, // ignored when IsMarket: true
+			Price:      slLimitPx,
 			ReduceOnly: true,
 			OrderType: hyperliquid.OrderType{
 				Trigger: &hyperliquid.TriggerOrderType{
@@ -547,7 +573,7 @@ func (c *Client) PlaceBracketOrder(
 			Coin:       pair,
 			IsBuy:      !isBuy,
 			Size:       sizeCoins,
-			Price:      0,
+			Price:      tpLimitPx,
 			ReduceOnly: true,
 			OrderType: hyperliquid.OrderType{
 				Trigger: &hyperliquid.TriggerOrderType{
@@ -639,6 +665,31 @@ func (c *Client) FetchCurrentPrice(ctx context.Context, pair string) (float64, e
 	}
 
 	return price, nil
+}
+
+// roundToSigFigs rounds a float64 to n significant figures.
+// Hyperliquid requires all prices to have at most 5 significant figures.
+func roundToSigFigs(v float64, n int) float64 {
+	if v == 0 {
+		return 0
+	}
+	d := math.Ceil(math.Log10(math.Abs(v)))
+	pow := math.Pow(10, float64(n)-d)
+	return math.Round(v*pow) / pow
+}
+
+// roundPrice rounds a price to Hyperliquid's requirements:
+// 1. At most 5 significant figures
+// 2. At most (6 - szDecimals) decimal places for perp assets
+func (c *Client) roundPrice(ctx context.Context, pair string, price float64) float64 {
+	price = roundToSigFigs(price, 5)
+	szDec := c.szDecimalsForPair(ctx, pair)
+	decPlaces := 6 - szDec
+	if decPlaces < 0 {
+		decPlaces = 0
+	}
+	factor := math.Pow(10, float64(decPlaces))
+	return math.Round(price*factor) / factor
 }
 
 // szDecimalsForPair returns the size decimals for a given pair.
