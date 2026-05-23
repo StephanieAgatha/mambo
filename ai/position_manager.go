@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"charm.land/fantasy"
-	"charm.land/fantasy/object"
 
 	"mambo/config"
 	"mambo/journal"
@@ -73,7 +72,7 @@ func (pm *PositionManager) Decide(
 		"pnl_pct", fmt.Sprintf("%.2f%%", currentPnLPct),
 	)
 
-	result, err := object.Generate[PositionDecision](ctx, pm.model, fantasy.ObjectCall{
+	result, err := generateObject[PositionDecision](ctx, pm.model, fantasy.ObjectCall{
 		Prompt:            fantasy.Prompt{fantasy.NewSystemMessage(pm.agentPrompt), fantasy.NewUserMessage(prompt)},
 		SchemaName:        "position_decision",
 		SchemaDescription: "A position management decision: hold, close, move_sl, or move_tp",

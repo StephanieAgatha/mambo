@@ -2,14 +2,18 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
+	"reflect"
 	"strings"
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/object"
+	"charm.land/fantasy/schema"
 
 	"mambo/config"
 	"mambo/filter"
@@ -49,6 +53,61 @@ type Scorer struct {
 	executePrompt string
 	model         fantasy.LanguageModel
 	cfg           *config.Config
+}
+
+// generateObject tries tool-based structured output first, then falls back to
+// text mode (schema injected into prompt) on validation/parse errors.
+// This handles models that don't reliably support forced tool calling.
+func generateObject[T any](
+	ctx context.Context,
+	model fantasy.LanguageModel,
+	call fantasy.ObjectCall,
+) (*fantasy.ObjectResult[T], error) {
+	result, err := object.Generate[T](ctx, model, call)
+	if err == nil {
+		return result, nil
+	}
+
+	// Only fall back on object generation errors (validation/parse), not network errors
+	var noObjErr *fantasy.NoObjectGeneratedError
+	if !errors.As(err, &noObjErr) {
+		return nil, err
+	}
+
+	slog.Warn("ai: tool-based object generation failed — retrying with text mode",
+		"err", err,
+	)
+
+	var zero T
+	s := schema.Generate(reflect.TypeOf(zero))
+	call.Schema = s
+
+	resp, textErr := object.GenerateWithText(ctx, model, call)
+	if textErr != nil {
+		return nil, err // return original error
+	}
+
+	var obj T
+	if unmarshalErr := unmarshalObject(resp.Object, &obj); unmarshalErr != nil {
+		return nil, err
+	}
+
+	return &fantasy.ObjectResult[T]{
+		Object:           obj,
+		RawText:          resp.RawText,
+		Usage:            resp.Usage,
+		FinishReason:     resp.FinishReason,
+		Warnings:         resp.Warnings,
+		ProviderMetadata: resp.ProviderMetadata,
+	}, nil
+}
+
+func unmarshalObject(obj any, target any) error {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, target)
 }
 
 // NewScorer loads AGENT.md and prompt files once at startup.
@@ -112,7 +171,7 @@ func (s *Scorer) Score(
 		"pair", pair,
 	)
 
-	result, err := object.Generate[ScoreResult](ctx, s.model, fantasy.ObjectCall{
+	result, err := generateObject[ScoreResult](ctx, s.model, fantasy.ObjectCall{
 		Prompt:            fantasy.Prompt{fantasy.NewSystemMessage(s.agentPrompt), fantasy.NewUserMessage(prompt)},
 		SchemaName:        "trade_decision",
 		SchemaDescription: "A trading decision with action, sizing, and structured reasoning",
@@ -160,7 +219,7 @@ func (s *Scorer) Suggest(
 		"pair", pair,
 	)
 
-	result, err := object.Generate[ScoreResult](ctx, s.model, fantasy.ObjectCall{
+	result, err := generateObject[ScoreResult](ctx, s.model, fantasy.ObjectCall{
 		Prompt:            fantasy.Prompt{fantasy.NewSystemMessage(s.suggestPrompt), fantasy.NewUserMessage(prompt)},
 		SchemaName:        "trade_suggestion",
 		SchemaDescription: "An advisory trade suggestion with reasoning",
@@ -199,7 +258,7 @@ func (s *Scorer) Execute(
 		"pair", pair,
 	)
 
-	result, err := object.Generate[ScoreResult](ctx, s.model, fantasy.ObjectCall{
+	result, err := generateObject[ScoreResult](ctx, s.model, fantasy.ObjectCall{
 		Prompt:            fantasy.Prompt{fantasy.NewSystemMessage(s.executePrompt), fantasy.NewUserMessage(prompt)},
 		SchemaName:        "trade_execution",
 		SchemaDescription: "A forced directional trade execution decision with sizing",
