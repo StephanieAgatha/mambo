@@ -1544,6 +1544,31 @@ func (b *Bot) handleExecute(s *discordgo.Session, i *discordgo.InteractionCreate
 				side = exchange.OrderSideShort
 			}
 
+			// validate TP/SL direction against entry
+			if side == exchange.OrderSideShort {
+				if userTP > taResult.CurrentPrice || userSL < taResult.CurrentPrice {
+					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+						Embeds: &[]*discordgo.MessageEmbed{{
+							Title:       fmt.Sprintf("❌ %s — Invalid TP/SL for SHORT", coin),
+							Description: fmt.Sprintf("For a SHORT: TP ($%.4f) must be below entry ($%.4f) and SL ($%.4f) must be above entry.", userTP, taResult.CurrentPrice, userSL),
+							Color:       ColorRed,
+						}},
+					})
+					return
+				}
+			} else {
+				if userTP < taResult.CurrentPrice || userSL > taResult.CurrentPrice {
+					s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+						Embeds: &[]*discordgo.MessageEmbed{{
+							Title:       fmt.Sprintf("❌ %s — Invalid TP/SL for LONG", coin),
+							Description: fmt.Sprintf("For a LONG: TP ($%.4f) must be above entry ($%.4f) and SL ($%.4f) must be below entry.", userTP, taResult.CurrentPrice, userSL),
+							Color:       ColorRed,
+						}},
+					})
+					return
+				}
+			}
+
 			// clamp leverage
 			if leverage < config.MinLeverageX {
 				leverage = config.MinLeverageX
